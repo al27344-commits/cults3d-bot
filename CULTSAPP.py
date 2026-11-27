@@ -1,3 +1,4 @@
+import base64
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from fractions import Fraction
@@ -12,7 +13,7 @@ import requests
 import streamlit as st
 
 st.set_page_config(
-    page_title="Cults3D Studio Pro v5 — Growth & SEO",
+    page_title="Cults3D Studio Pro v6 — AI & Growth",
     page_icon="🧊",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -49,6 +50,13 @@ st.markdown(
     .seo-card {
         background-color: rgba(128, 128, 128, 0.07);
         border-left: 4px solid #00a8e8;
+        border-radius: 8px;
+        padding: 14px 18px;
+        margin-bottom: 12px;
+    }
+    .ai-card {
+        background-color: rgba(138, 43, 226, 0.08);
+        border-left: 4px solid #9d4edd;
         border-radius: 8px;
         padding: 14px 18px;
         margin-bottom: 12px;
@@ -113,7 +121,6 @@ STATE_FILE = get_state_file_path()
 
 
 def next_golden_hour_utc() -> datetime:
-    """Calcula a próxima Hora de Ouro (Sexta 18:00 ou Domingo 15:00 hora local) em UTC."""
     now_local = datetime.now().astimezone()
     candidates: List[datetime] = []
     for days_ahead in range(0, 8):
@@ -131,18 +138,196 @@ def next_golden_hour_utc() -> datetime:
 
 
 # ==============================================================================
+# MOTOR DE INTELIGÊNCIA ARTIFICIAL (GOOGLE GEMINI FREE API + VISÃO)
+# ==============================================================================
+class GeminiGrowthAI:
+    MODELS = ["gemini-2.5-flash", "gemini-2.0-flash"]
+
+    @staticmethod
+    def get_api_key() -> str:
+        return get_secret_val("GEMINI_API_KEY", "")
+
+    @classmethod
+    def is_configured(cls) -> bool:
+        return bool(cls.get_api_key())
+
+    @classmethod
+    def _call_gemini(
+        cls,
+        prompt: str,
+        images: Optional[List[Tuple[bytes, str]]] = None,
+        expect_json: bool = False,
+    ) -> str:
+        api_key = cls.get_api_key()
+        if not api_key:
+            raise CultsAPIError("GEMINI_API_KEY não encontrada nos Secrets.")
+
+        parts: List[Dict[str, Any]] = [{"text": prompt}]
+        for img_bytes, mime_type in (images or [])[:3]:
+            b64_data = base64.b64encode(img_bytes).decode("ascii")
+            parts.append({
+                "inline_data": {
+                    "mime_type": mime_type or "image/jpeg",
+                    "data": b64_data,
+                }
+            })
+
+        payload: Dict[str, Any] = {
+            "contents": [{"parts": parts}],
+            "generationConfig": {
+                "temperature": 0.45,
+                "maxOutputTokens": 1800,
+            },
+        }
+        if expect_json:
+            payload["generationConfig"]["responseMimeType"] = "application/json"
+
+        last_err = ""
+        for model_name in cls.MODELS:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
+            try:
+                resp = requests.post(url, params={"key": api_key}, json=payload, timeout=45)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    cands = data.get("candidates") or []
+                    if cands:
+                        out_parts = ((cands[0].get("content") or {}).get("parts") or [])
+                        text_out = "".join(p.get("text", "") for p in out_parts).strip()
+                        if text_out:
+                            return text_out
+                last_err = f"{model_name} HTTP {resp.status_code}: {resp.text[:200]}"
+            except Exception as exc:
+                last_err = f"{model_name}: {exc}"
+
+        raise CultsAPIError(f"Erro na API Gemini: {last_err}")
+
+    @staticmethod
+    def _parse_json_response(raw_text: str) -> Dict[str, Any]:
+        cleaned = raw_text.strip()
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+        match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
+        if match:
+            cleaned = match.group(0)
+        return json.loads(cleaned)
+
+    @classmethod
+    def generate_listing_from_images(
+        cls,
+        images: List[Tuple[bytes, str]],
+        user_hint: str,
+        currency: str = "EUR",
+        locale: str = "EN",
+    ) -> Dict[str, Any]:
+        prompt = f"""
+You are a top-performing Cults3D 3D-printing marketplace SEO & conversion copywriter.
+Analyze the attached 3D model photo(s) and the creator's hint: "{user_hint or '3D printable functional part'}".
+Target listing language: {locale}. Currency: {currency}.
+
+Create a high-converting Cults3D product listing. Rules:
+1. "title": Clear, keyword-rich title (35-75 chars). Include exact model compatibility, part function, and both metric (mm) and imperial (inches) dimensions if any size is mentioned or visible.
+2. "overview": Persuasive 2-3 sentence summary explaining what problem this part solves, fitment accuracy, and why it is better than generic alternatives.
+3. "print_settings": Bullet list with recommended material (e.g. PETG/ASA/ABS for automotive/outdoor, PLA+ for indoor), layer height, infill, walls, and supports.
+4. "assembly": Short practical installation/post-processing instructions.
+5. "faq": 2 short Q&A bullet points answering buyer doubts (heat resistance, supports, fitment).
+6. "tags": Array of exactly 20 lowercase SEO tags ordered by search weight (most important exact terms in the first 5).
+7. "suggested_price": Realistic price float in {currency} (e.g. 2.90, 3.50, 4.90; or 0.0 if clearly a simple freebie).
+
+Return strictly valid JSON with keys: title, overview, print_settings, assembly, faq, tags, suggested_price.
+"""
+        raw = cls._call_gemini(prompt, images=images, expect_json=True)
+        return cls._parse_json_response(raw)
+
+    @classmethod
+    def rewrite_listing_seo(
+        cls,
+        name: str,
+        description: str,
+        tags: List[str],
+        views: int,
+        sales: int,
+        price: float,
+        currency: str = "EUR",
+    ) -> Dict[str, Any]:
+        prompt = f"""
+You are a Cults3D conversion & SEO specialist. Optimize this existing listing to maximize search rank and buyer conversion.
+Current stats: {views} views, {sales} sales, price {price:.2f} {currency}.
+Current title: "{name}"
+Current tags: {json.dumps(tags)}
+Current description:
+\"\"\"{description[:2500]}\"\"\"
+
+Instructions:
+1. Keep all factual dimensions and technical specs accurate, adding imperial (inch) equivalents next to mm measurements if missing.
+2. Make the title crisp, searchable, and high-CTR (35-75 chars).
+3. Structure the description with clear sections (Overview, Print Settings, Fitment & FAQ) so hesitant buyers feel confident purchasing. Preserve any existing '=== TOP DESIGNS ===' block if present.
+4. Provide exactly 20 lowercase SEO tags ordered from highest search intent (top 5) to broader category terms.
+
+Return strictly valid JSON with keys: "title" (string), "description" (string), "tags" (list of 20 strings), "summary" (short 1-sentence explanation in Portuguese of what was improved).
+"""
+        raw = cls._call_gemini(prompt, expect_json=True)
+        return cls._parse_json_response(raw)
+
+    @classmethod
+    def analyze_niche_strategy(
+        cls,
+        keyword: str,
+        total_listings: int,
+        avg_price: float,
+        med_price: float,
+        avg_dl: float,
+        top_titles: List[str],
+        bigrams: List[str],
+        currency: str = "EUR",
+    ) -> str:
+        prompt = f"""
+És um estratega de vendas no Cults3D. Analisa este nicho pesquisado pelo criador e responde em Português de Portugal (PT-PT), direto ao ponto em 4 bullet points curtos:
+- Nicho pesquisado: "{keyword}"
+- Total de anúncios no Cults3D: {total_listings}
+- Preço médio / mediana: {avg_price:.2f} / {med_price:.2f} {currency}
+- Média de downloads por peça na amostra: {avg_dl:.1f}
+- Títulos dos líderes: {json.dumps(top_titles[:8], ensure_ascii=False)}
+- Expressões mais frequentes: {json.dumps(bigrams[:6], ensure_ascii=False)}
+
+Diz:
+1. Nível de oportunidade real (Vale a pena entrar ou está saturado?).
+2. Preço exato recomendado para entrar e maximizar lucro.
+3. O que falta nos anúncios dos concorrentes que podemos explorar para roubar vendas.
+4. Um exemplo de título vencedor pronto a usar.
+"""
+        return cls._call_gemini(prompt, expect_json=False)
+
+    @classmethod
+    def generate_social_post(
+        cls,
+        name: str,
+        url: str,
+        price: float,
+        currency: str,
+        is_promo: bool = False,
+        discount_pct: int = 0,
+    ) -> str:
+        promo_ctx = f"Currently on a {discount_pct}% flash discount." if is_promo else (
+            "Free STL download." if price == 0 else f"Price: {price:.2f} {currency}."
+        )
+        prompt = f"""
+Write a short, authentic, non-spammy Reddit post (for r/functionalprint or r/3Dprinting) in English showcasing this 3D printable design:
+Model: "{name}"
+Info: {promo_ctx}
+Link: {url}
+Max 3 sentences, maker-to-maker tone, mention recommended filament (PETG/ASA/PLA) naturally. Output ONLY the post text.
+"""
+        return cls._call_gemini(prompt, expect_json=False)
+
+
+# ==============================================================================
 # CLOUD ASSET UPLOADER (PONTE DRAG & DROP -> HTTPS DIRETO PARA CULTS3D)
 # ==============================================================================
 class CloudAssetUploader:
-    """Carrega ficheiros locais (imagens e STL/3MF) para alojamento HTTPS direto
-    para que o Cults3D os importe automaticamente via GraphQL sem configuração externa.
-    """
-
     @staticmethod
     def upload_bytes(file_bytes: bytes, filename: str, mime_type: str = "application/octet-stream") -> str:
         errors: List[str] = []
 
-        # 1. Catbox.moe (Link direto permanente até 200MB)
         try:
             resp = requests.post(
                 "https://catbox.moe/user/api.php",
@@ -158,7 +343,6 @@ class CloudAssetUploader:
         except Exception as exc:
             errors.append(f"Catbox ({exc})")
 
-        # 2. Litterbox (Link direto 24h — suficiente para ingestão imediata pelo Cults3D)
         try:
             resp = requests.post(
                 "https://litterbox.catbox.moe/resources/internals/api.php",
@@ -174,7 +358,6 @@ class CloudAssetUploader:
         except Exception as exc:
             errors.append(f"Litterbox ({exc})")
 
-        # 3. Tmpfiles.org (Fallback com conversão para link /dl/)
         try:
             resp = requests.post(
                 "https://tmpfiles.org/api/v1/upload",
@@ -185,8 +368,7 @@ class CloudAssetUploader:
                 data = resp.json()
                 raw_url = ((data.get("data") or {}).get("url") or "").strip()
                 if raw_url.startswith("http"):
-                    direct = raw_url.replace("http://", "https://").replace("tmpfiles.org/", "tmpfiles.org/dl/", 1)
-                    return direct
+                    return raw_url.replace("http://", "https://").replace("tmpfiles.org/", "tmpfiles.org/dl/", 1)
             errors.append(f"Tmpfiles ({resp.status_code})")
         except Exception as exc:
             errors.append(f"Tmpfiles ({exc})")
@@ -195,7 +377,7 @@ class CloudAssetUploader:
 
 
 # ==============================================================================
-# MOTOR DE SEO & OTIMIZAÇÃO DE CONVERSÃO (20 TAGS + DUPLA UNIDADE + AUDITORIA)
+# MOTOR DE SEO & OTIMIZAÇÃO ALGORÍTMICA (20 TAGS + DUPLA UNIDADE + AUDITORIA)
 # ==============================================================================
 class SeoOptimizerEngine:
     STOPWORDS = {
@@ -220,7 +402,6 @@ class SeoOptimizerEngine:
 
     @classmethod
     def enrich_metric_units(cls, text: str) -> str:
-        """Adiciona equivalência em polegadas junto a medidas em mm (ex: 8mm -> 8mm (5/16\")) se ainda não existir."""
         if not text:
             return text
 
@@ -243,7 +424,6 @@ class SeoOptimizerEngine:
 
     @classmethod
     def extract_priority_keywords(cls, title: str, description: str = "") -> List[str]:
-        """Extrai termos de alto impacto do título (peso 2x) e descrição para liderarem as tags."""
         title_tokens = [
             w for w in re.findall(r"[a-z0-9À-ÿ\-]{2,}", title.lower())
             if w not in cls.STOPWORDS and not w.isdigit()
@@ -251,8 +431,7 @@ class SeoOptimizerEngine:
         bigrams: List[str] = []
         if len(title_tokens) >= 2:
             for i in range(len(title_tokens) - 1):
-                bg = f"{title_tokens[i]} {title_tokens[i + 1]}"
-                bigrams.append(bg)
+                bigrams.append(f"{title_tokens[i]} {title_tokens[i + 1]}")
 
         desc_tokens = [
             w for w in re.findall(r"[a-z0-9À-ÿ]{3,}", description.lower())
@@ -276,12 +455,10 @@ class SeoOptimizerEngine:
         extra_priority_tags: Optional[List[str]] = None,
         max_tags: int = 20,
     ) -> List[str]:
-        """Constrói até 20 tags ordenadas por relevância (Top 5 com palavras do título)."""
         priority_from_title = cls.extract_priority_keywords(title, description)
         clean_existing = [t.strip().lower() for t in existing_tags if t.strip()]
         clean_extra = [t.strip().lower() for t in (extra_priority_tags or []) if t.strip()]
 
-        # Ordem de peso: Tags extra prioritárias -> Keywords do título -> Tags atuais -> Base 3D
         pool = clean_extra + priority_from_title + clean_existing + cls.BASE_3D_TAGS
         final_tags: List[str] = []
         for tag in pool:
@@ -310,7 +487,7 @@ class SeoOptimizerEngine:
             score += 20
         elif d_len >= 120:
             score += 12
-            tips.append("Expande a descrição (> 300 caracteres) com tolerâncias, montagem e vantagens.")
+            tips.append("Expande a descrição (ideal acima de 300 caracteres) com tolerâncias, montagem e vantagens.")
         else:
             tips.append("Descrição muito curta. O motor de busca favorece descrições técnicas completas.")
 
@@ -1007,7 +1184,7 @@ class Cults3DClient:
 
 
 # ==============================================================================
-# HELPERS DE MARKETING & KIT SOCIAL TELEGRAM
+# HELPERS DE MARKETING & KIT SOCIAL TELEGRAM (COM FALLBACK IA)
 # ==============================================================================
 def build_social_promo_kit(
     name: str,
@@ -1017,6 +1194,13 @@ def build_social_promo_kit(
     is_promo: bool = False,
     discount_pct: int = 0,
 ) -> str:
+    if GeminiGrowthAI.is_configured():
+        try:
+            ai_post = GeminiGrowthAI.generate_social_post(name, url, price, currency, is_promo, discount_pct)
+            return f"📣 <b>Kit de Divulgação IA Pronto a Colar:</b>\n<code>{ai_post}</code>"
+        except Exception:
+            pass
+
     price_tag = (
         f"🔥 {discount_pct}% OFF right now!"
         if is_promo
@@ -1458,9 +1642,10 @@ class CultsBotEngine:
                     gov = GOVERNOR.get_stats()
                     state_lbl = "🟢 ATIVO" if self.running else "🔴 PAUSADO"
                     mode_lbl = "🧪 Simulação" if self.config.get("dry_run") else "⚡ Real"
+                    ai_lbl = "🧠 Gemini Ativa" if GeminiGrowthAI.is_configured() else "⚪ Sem IA"
                     self.send_notification(
-                        f"🤖 <b>Estado Cults3D Studio Pro v5</b>\n"
-                        f"Estado: {state_lbl} ({mode_lbl})\n"
+                        f"🤖 <b>Estado Cults3D Studio Pro v6</b>\n"
+                        f"Estado: {state_lbl} ({mode_lbl}) | {ai_lbl}\n"
                         f"Anti-Sleep: {self.keepalive_status}\n"
                         f"Último ciclo: {self.last_run or 'Nunca'}\n"
                         f"Quota API hoje: {gov['calls_today']}/{gov['daily_soft_limit']}"
@@ -1708,7 +1893,6 @@ class CultsBotEngine:
                         "sales": csales,
                     }
 
-                # Early-Bird
                 eb_rule = self.early_bird_rules.get(cid)
                 if eb_rule and not eb_rule.get("completed") and actions_done < max_actions:
                     target_s = int(eb_rule.get("target_sales", 3))
@@ -1736,7 +1920,6 @@ class CultsBotEngine:
                         except Exception:
                             pass
 
-                # Teste A/B por RPM
                 ab = self.ab_tests.get(cid)
                 if ab and ab.get("phase") in ("A", "B") and actions_done < max_actions:
                     try:
@@ -1782,7 +1965,6 @@ class CultsBotEngine:
                     except Exception as exc:
                         self.log("ERRO", f"Falha Teste A/B em '{cname}': {exc}")
 
-                # Auto-Promo (0 Vendas)
                 if (
                     actions_done < max_actions
                     and cfg.get("rule_auto_promo")
@@ -1818,7 +2000,6 @@ class CultsBotEngine:
                                 ).strftime("%Y-%m-%dT%H:%M:%SZ")
                             self.log("AVISO", f"Auto-Promo ignorada em '{cname}': {exc}")
 
-                # Reativação Estagnados
                 if (
                     actions_done < max_actions
                     and cfg.get("rule_stagnant_revival")
@@ -1848,7 +2029,6 @@ class CultsBotEngine:
                         except Exception:
                             pass
 
-                # Preço Dinâmico
                 if (
                     actions_done < max_actions
                     and cfg.get("rule_dynamic_price")
@@ -1879,7 +2059,6 @@ class CultsBotEngine:
                                 except Exception as exc:
                                     self.log("ERRO", f"Falha preço em '{cname}': {exc}")
 
-                # Flash Fim de Semana
                 if trigger_weekend_flash and cprice > 0 and not self._is_in_promo_cooldown(cid):
                     w_pct = int(cfg.get("weekend_discount_pct", 20))
                     w_days = int(cfg.get("weekend_days", 3))
@@ -1895,7 +2074,6 @@ class CultsBotEngine:
                         except Exception:
                             pass
 
-                # Vitrine Dinâmica & SEO
                 new_desc_candidate = cdesc
                 desc_modified = False
 
@@ -1974,7 +2152,6 @@ class CultsBotEngine:
                 self.log("TRÁFEGO", f"{len(spike_alerts)} modelo(s) com pico de tráfego!")
                 self.send_notification("🚀 <b>Pico de Tráfego Detetado!</b>\n" + "\n".join(spike_alerts[:6]))
 
-            # Fila de Publicação Agendada
             if cfg.get("rule_queue_publisher", True) and self.publish_queue:
                 now_utc = datetime.now(timezone.utc)
                 with self._lock:
@@ -2023,7 +2200,6 @@ class CultsBotEngine:
                                 self.log("ERRO", f"Falha ao publicar '{item['name']}': {exc}")
                         break
 
-            # Radar de Nichos
             keywords = [k.strip() for k in str(cfg.get("watch_keywords", "")).split(",") if k.strip()]
             if cfg.get("rule_market_watch") and keywords:
                 seen_m = set(self.seen_market_ids)
@@ -2058,7 +2234,6 @@ class CultsBotEngine:
                         + "\n".join(found_new_items[:5])
                     )
 
-            # Relatórios Diário & Semanal
             local_date_str = now_local.strftime("%Y-%m-%d")
             total_v = sum(int(c.get("viewsCount") or 0) for c in creations)
             total_d = sum(int(c.get("downloadsCount") or 0) for c in creations)
@@ -2118,18 +2293,18 @@ class CultsBotEngine:
 
 
 @st.cache_resource
-def get_bot_engine(version: str = "studio_pro_v5") -> CultsBotEngine:
+def get_bot_engine(version: str = "studio_pro_v6") -> CultsBotEngine:
     return CultsBotEngine()
 
 
-bot = get_bot_engine("studio_pro_v5")
+bot = get_bot_engine("studio_pro_v6")
 if not hasattr(bot, "ping_keep_alive"):
     try:
         bot.stop()
     except Exception:
         pass
     get_bot_engine.clear()
-    bot = get_bot_engine("studio_pro_v5")
+    bot = get_bot_engine("studio_pro_v6")
 
 # Arranque automático via Secrets (Cloud 24/7)
 _srv_user = get_secret_val("CULTS_USERNAME")
@@ -2189,35 +2364,22 @@ if not st.session_state.connected:
     st.markdown("<br>", unsafe_allow_html=True)
     _, center_col, _ = st.columns([1, 2, 1])
     with center_col:
-        st.title("🧊 Cults3D Studio Pro v5")
+        st.title("🧊 Cults3D Studio Pro v6")
         st.write(
-            "Plataforma completa de Business Intelligence, Upload Drag & Drop, Estúdio SEO em Massa e Bot Autónomo 24/7."
+            "Plataforma com Gemini Vision IA, Upload Drag & Drop, Estúdio SEO em Massa e Bot Autónomo 24/7."
         )
 
         with st.form("login_form"):
-            in_user = st.text_input(
-                "Username Cults3D",
-                value=st.session_state.username,
-                placeholder="Ex: FSDesigns",
-            )
-            in_key = st.text_input(
-                "API Key",
-                value=st.session_state.api_key,
-                type="password",
-                placeholder="Cola aqui a tua API Key",
-            )
+            in_user = st.text_input("Username Cults3D", value=st.session_state.username, placeholder="Ex: FSDesigns")
+            in_key = st.text_input("API Key", value=st.session_state.api_key, type="password")
             in_curr = st.selectbox("Moeda principal", ["EUR", "USD", "GBP"], index=0)
-            submit_login = st.form_submit_button(
-                "🔌 Ligar e Sincronizar Conta",
-                type="primary",
-                use_container_width=True,
-            )
+            submit_login = st.form_submit_button("🔌 Ligar e Sincronizar Conta", type="primary", use_container_width=True)
 
         if submit_login:
             if not in_user.strip() or not in_key.strip():
                 st.warning("Preenche o username e a API Key.")
             else:
-                with st.spinner("A ligar ao Cults3D, a validar schema e a sincronizar dados..."):
+                with st.spinner("A ligar ao Cults3D e a sincronizar dados..."):
                     try:
                         temp_client = Cults3DClient(in_user, in_key)
                         sync_account(temp_client, in_curr)
@@ -2243,6 +2405,11 @@ with st.sidebar:
     nick = (st.session_state.profile or {}).get("nick", st.session_state.username)
     st.success(f"Conta: **{nick}**")
     st.caption(f"📦 {len(st.session_state.creations)} modelos | 💰 {len(st.session_state.sales)} vendas")
+
+    if GeminiGrowthAI.is_configured():
+        st.success("🧠 Gemini AI: **ATIVA**")
+    else:
+        st.warning("🧠 Gemini AI: Sem chave nos Secrets")
 
     gov_stats = GOVERNOR.get_stats()
     st.progress(
@@ -2337,10 +2504,10 @@ df_creations, df_sales = build_dataframes()
 
 tab_dash, tab_publish, tab_bulk, tab_bot, tab_market, tab_console = st.tabs([
     "📊 Analytics & BI",
-    "🚀 Publicar (Drag & Drop)",
+    "🚀 Publicar (IA + Drag & Drop)",
     "⚡ Gestão & SEO em Massa",
     "🤖 Bot & Growth Engine",
-    "🔍 Radar N-Gram",
+    "🔍 Radar N-Gram + IA",
     "🛠️ Consola GraphQL",
 ])
 
@@ -2449,7 +2616,7 @@ with tab_dash:
             },
         )
 
-        with st.expander("🔬 Inspetor & Otimizador Individual (1 Clique)"):
+        with st.expander("🔬 Inspetor & Otimizador Individual (IA + SEO)", expanded=True):
             model_names_map = {row["nome"]: row for _, row in perf_df.iterrows()}
             chosen_name = st.selectbox("Escolhe um modelo", list(model_names_map.keys()))
             m_row = model_names_map[chosen_name]
@@ -2464,7 +2631,28 @@ with tab_dash:
             if seo_eval["tips"]:
                 st.warning("💡 **Oportunidades SEO:** " + " | ".join(seo_eval["tips"]))
 
-            if st.button("✨ Auto-Preencher SEO & 20 Tags Otimizadas nos Campos Abaixo", key="btn_autofill_single"):
+            opt_c1, opt_c2 = st.columns(2)
+            if opt_c1.button("🧠 Reescrever Anúncio com Gemini IA (Foco em Vendas)", type="primary", use_container_width=True):
+                with st.spinner("A IA está a reescrever o título, descrição e 20 tags..."):
+                    try:
+                        ai_res = GeminiGrowthAI.rewrite_listing_seo(
+                            m_row["nome"],
+                            m_row["descricao"],
+                            m_row["tags_list"],
+                            int(m_row["views"]),
+                            int(m_row["vendas"]),
+                            float(m_row["preco"]),
+                            currency,
+                        )
+                        st.session_state[f"qe_n_{m_row['id']}"] = ai_res.get("title", m_row["nome"])
+                        st.session_state[f"qe_d_{m_row['id']}"] = ai_res.get("description", m_row["descricao"])
+                        st.session_state[f"qe_t_{m_row['id']}"] = ", ".join(ai_res.get("tags") or m_row["tags_list"])
+                        st.session_state[f"qe_msg_{m_row['id']}"] = ai_res.get("summary", "Anúncio otimizado pela IA!")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(str(e))
+
+            if opt_c2.button("⚡ Otimização Rápida (Regras + 20 Tags)", use_container_width=True):
                 opt_n, opt_d, opt_t = SeoOptimizerEngine.auto_optimize_listing(
                     m_row["nome"], m_row["descricao"], m_row["tags_list"]
                 )
@@ -2473,12 +2661,15 @@ with tab_dash:
                 st.session_state[f"qe_t_{m_row['id']}"] = ", ".join(opt_t)
                 st.rerun()
 
+            if st.session_state.get(f"qe_msg_{m_row['id']}"):
+                st.markdown(f"<div class='ai-card'>🧠 <b>IA:</b> {st.session_state[f'qe_msg_{m_row[\"id\"]}']}</div>", unsafe_allow_html=True)
+
             with st.form("quick_edit_single_form"):
                 qe_name = st.text_input("Título", value=st.session_state.get(f"qe_n_{m_row['id']}", m_row["nome"]))
                 qe_price = st.number_input(f"Preço ({currency})", min_value=0.0, step=0.5, value=float(m_row["preco"]))
                 qe_tags = st.text_input("Tags (até 20, separadas por vírgula)", value=st.session_state.get(f"qe_t_{m_row['id']}", m_row["tags"]))
-                qe_desc = st.text_area("Descrição", value=st.session_state.get(f"qe_d_{m_row['id']}", m_row["descricao"]), height=140)
-                if st.form_submit_button("💾 Guardar Alterações no Cults3D", type="primary"):
+                qe_desc = st.text_area("Descrição", value=st.session_state.get(f"qe_d_{m_row['id']}", m_row["descricao"]), height=160)
+                if st.form_submit_button("💾 Aplicar no Cults3D", type="primary"):
                     try:
                         final_tags = [t.strip() for t in qe_tags.split(",") if t.strip()][:20]
                         client.update_creation(
@@ -2490,34 +2681,33 @@ with tab_dash:
                             tags=final_tags,
                         )
                         bot.record_action(
-                            "EDIÇÃO_INDIVIDUAL",
+                            "EDIÇÃO_IA_SEO",
                             m_row["id"],
                             m_row["nome"],
-                            f"SEO & Preço ({qe_price:.2f} {currency})",
+                            f"Título/SEO/Preço ({qe_price:.2f} {currency})",
                             before_state={"name": m_row["nome"], "description": m_row["descricao"], "price": m_row["preco"], "tags": m_row["tags_list"]},
                             after_state={"name": qe_name.strip(), "description": qe_desc.strip(), "price": qe_price, "tags": final_tags},
                             reversible=True,
                         )
                         st.session_state.creations = client.get_all_my_creations(currency=currency)
-                        st.success("Modelo atualizado e backup guardado no Rollback!")
+                        st.success("Modelo atualizado no Cults3D e backup guardado no Rollback!")
                         st.rerun()
                     except Exception as e:
                         st.error(str(e))
 
 
 # ==============================================================================
-# ABA 2: ESTÚDIO DE PUBLICAÇÃO (DRAG & DROP DIRETO + SEO AUTOMÁTICO)
+# ABA 2: ESTÚDIO DE PUBLICAÇÃO (VISÃO IA + DRAG & DROP DIRETO)
 # ==============================================================================
 with tab_publish:
-    st.subheader("🚀 Estúdio de Publicação — Arrastar & Largar Direto")
+    st.subheader("🚀 Estúdio de Publicação — Visão IA + Arrastar & Largar")
 
     with bot._lock:
         presets_dict = dict(bot.presets)
 
     selected_preset_name = st.selectbox(
-        "Selecionar Gama / Template de Produto",
-        ["(Personalizado / Em branco)"] + list(presets_dict.keys()),
-        help="Preenche automaticamente parâmetros de impressão, FAQ anti-dúvidas, preço e tags.",
+        "Selecionar Gama / Template Base (opcional)",
+        ["(Usar IA a partir das Fotos / Em branco)"] + list(presets_dict.keys()),
     )
     active_preset = presets_dict.get(selected_preset_name, {})
 
@@ -2527,9 +2717,73 @@ with tab_publish:
     col_form, col_preview = st.columns([1.45, 1])
 
     with col_form:
-        p_name = st.text_input("Título do Modelo *", placeholder="Ex: Seat Leon Mk2 (1P) - 52mm Air Vent Turbo Gauge Pod")
+        st.markdown("#### 1️⃣ Arrasta as Fotos & Ficheiros 3D")
+        uploaded_images = st.file_uploader(
+            "Fotos / Renders do modelo (a 1.ª será a capa e a IA analisa até 3 fotos)",
+            type=["png", "jpg", "jpeg", "webp"],
+            accept_multiple_files=True,
+            key="pub_img_uploader",
+        )
+        if uploaded_images:
+            img_cols = st.columns(min(4, len(uploaded_images)))
+            for idx_img, up_img in enumerate(uploaded_images):
+                with img_cols[idx_img % 4]:
+                    st.image(up_img, caption=f"{'⭐ Capa' if idx_img == 0 else f'Foto {idx_img + 1}'}", use_container_width=True)
 
-        c1, c2, c3 = st.columns(3)
+        uploaded_3d_files = st.file_uploader(
+            "Ficheiros 3D para Impressão (STL, 3MF, OBJ, STEP, ZIP)",
+            type=["stl", "3mf", "obj", "step", "stp", "zip"],
+            accept_multiple_files=True,
+            key="pub_3d_uploader",
+        )
+        if uploaded_3d_files:
+            for up_f in uploaded_3d_files:
+                size_kb = round(up_f.size / 1024.0, 1)
+                st.markdown(f"<div class='upload-badge'>📄 <b>{up_f.name}</b> ({size_kb} KB) — Pronto</div>", unsafe_allow_html=True)
+
+        st.markdown("#### 2️⃣ Assistente Visão IA (Preenche Tudo Sozinho)")
+        ai_c1, ai_c2 = st.columns([2.2, 1.3])
+        ai_hint = ai_c1.text_input(
+            "Dica curta para a IA (modelo, carro, medidas)",
+            placeholder="Ex: Clip acabamento painel 8mm furo 20mm cabeça, ou Suporte 52mm Seat Leon Mk2",
+        )
+        p_locale = ai_c2.selectbox("Idioma do Anúncio", ["EN", "PT", "ES", "FR", "DE"], index=0)
+
+        if st.button("✨ Gerar Título, Descrição & 20 Tags com Gemini IA", type="primary", use_container_width=True):
+            if not uploaded_images and not ai_hint.strip():
+                st.warning("Arrasta pelo menos 1 foto ou escreve uma dica curta para a IA gerar o anúncio.")
+            else:
+                with st.spinner("A IA está a analisar as imagens e a escrever o anúncio SEO..."):
+                    try:
+                        img_payload = [(im.getvalue(), im.type or "image/jpeg") for im in (uploaded_images or [])[:3]]
+                        ai_gen = GeminiGrowthAI.generate_listing_from_images(
+                            images=img_payload,
+                            user_hint=ai_hint.strip(),
+                            currency=currency,
+                            locale=p_locale,
+                        )
+                        st.session_state["pub_name_val"] = ai_gen.get("title", "")
+                        st.session_state["pub_overview_val"] = ai_gen.get("overview", "")
+                        st.session_state["pub_settings_val"] = ai_gen.get("print_settings", "")
+                        st.session_state["pub_assembly_val"] = ai_gen.get("assembly", "")
+                        st.session_state["pub_faq_val"] = ai_gen.get("faq", "")
+                        st.session_state["pub_tags_val"] = ", ".join(ai_gen.get("tags") or [])
+                        if ai_gen.get("suggested_price") is not None:
+                            st.session_state["pub_price_val"] = float(ai_gen["suggested_price"])
+                        st.toast("Anúncio gerado com sucesso pela IA!")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(str(e))
+
+        st.divider()
+        st.markdown("#### 3️⃣ Rever & Ajustar Detalhes")
+        p_name = st.text_input(
+            "Título do Modelo *",
+            value=st.session_state.get("pub_name_val", ""),
+            placeholder="Ex: Seat Leon Mk2 (1P) - 52mm Air Vent Turbo Gauge Pod",
+        )
+
+        c1, c2 = st.columns([2, 1])
         if cat_map:
             default_cat_idx = 0
             hint = str(active_preset.get("category_hint", "")).lower()
@@ -2543,49 +2797,22 @@ with tab_publish:
         else:
             p_cat_id = c1.text_input("ID da Categoria *")
 
-        p_price = c2.number_input(f"Preço ({currency})", min_value=0.0, step=0.5, value=float(active_preset.get("price", 2.90)))
-        p_locale = c3.selectbox("Idioma", ["EN", "PT", "ES", "FR", "DE"], index=0)
+        default_price_val = float(st.session_state.get("pub_price_val", active_preset.get("price", 2.90)))
+        p_price = c2.number_input(f"Preço ({currency})", min_value=0.0, step=0.5, value=default_price_val)
 
-        st.markdown("#### 🖼️ Fotos & Renders do Modelo (Arrasta para aqui)")
-        uploaded_images = st.file_uploader(
-            "Arrasta as fotos/renders do modelo (a 1.ª imagem será a capa principal)",
-            type=["png", "jpg", "jpeg", "webp"],
-            accept_multiple_files=True,
-            key="pub_img_uploader",
-        )
-        if uploaded_images:
-            img_cols = st.columns(min(4, len(uploaded_images)))
-            for idx_img, up_img in enumerate(uploaded_images):
-                with img_cols[idx_img % 4]:
-                    st.image(up_img, caption=f"{'⭐ Capa' if idx_img == 0 else f'Foto {idx_img + 1}'}", use_container_width=True)
+        d_overview = st.text_area("Resumo & Funcionalidades *", value=st.session_state.get("pub_overview_val", active_preset.get("overview", "")), height=75)
+        d_settings = st.text_area("Definições de Impressão 3D *", value=st.session_state.get("pub_settings_val", active_preset.get("print_settings", "")), height=95)
+        d_assembly = st.text_area("Montagem & Hardware", value=st.session_state.get("pub_assembly_val", active_preset.get("assembly", "")), height=55)
+        d_faq = st.text_area("FAQ Anti-Dúvidas", value=st.session_state.get("pub_faq_val", active_preset.get("faq", "")), height=60)
+        d_license = st.text_input("Aviso de Licença", value=active_preset.get("license", "Personal use only."))
 
-        st.markdown("#### 📦 Ficheiros 3D para Impressão (Arrasta para aqui)")
-        uploaded_3d_files = st.file_uploader(
-            "Arrasta os ficheiros STL, 3MF, OBJ, STEP ou ZIP",
-            type=["stl", "3mf", "obj", "step", "stp", "zip"],
-            accept_multiple_files=True,
-            key="pub_3d_uploader",
-        )
-        if uploaded_3d_files:
-            for up_f in uploaded_3d_files:
-                size_kb = round(up_f.size / 1024.0, 1)
-                st.markdown(f"<div class='upload-badge'>📄 <b>{up_f.name}</b> ({size_kb} KB) — Pronto para envio automático</div>", unsafe_allow_html=True)
+        auto_imperial_pub = st.checkbox("Converter medidas mm ➔ polegadas automaticamente", value=True)
+        p_tags = st.text_input("Tags SEO (até 20, vírgula) *", value=st.session_state.get("pub_tags_val", active_preset.get("tags", "")))
 
-        with st.expander("🔗 Opcional: Adicionar também links HTTPS externos manualmente"):
-            manual_files_txt = st.text_area("URLs Ficheiros 3D (1 por linha)", height=60)
-            manual_imgs_txt = st.text_area("URLs Imagens (1 por linha)", height=60)
+        with st.expander("🔗 Opcional: Links HTTPS externos manuais"):
+            manual_files_txt = st.text_area("URLs Ficheiros 3D (1 por linha)", height=55)
+            manual_imgs_txt = st.text_area("URLs Imagens (1 por linha)", height=55)
 
-        st.markdown("#### 📝 Descrição Estruturada & Tags")
-        d_overview = st.text_area("1. Resumo & Funcionalidades *", value=active_preset.get("overview", ""), height=75)
-        d_settings = st.text_area("2. Definições de Impressão 3D *", value=active_preset.get("print_settings", ""), height=95)
-        d_assembly = st.text_area("3. Montagem & Hardware", value=active_preset.get("assembly", ""), height=55)
-        d_faq = st.text_area("4. FAQ Anti-Dúvidas (reduz abandono)", value=active_preset.get("faq", ""), height=60)
-        d_license = st.text_input("5. Aviso de Licença", value=active_preset.get("license", "Personal use only."))
-
-        auto_imperial_pub = st.checkbox("Converter medidas mm ➔ polegadas automaticamente (ex: 8mm ➔ 8mm (5/16\"))", value=True)
-        p_tags = st.text_input("Tags SEO (até 20, separadas por vírgula) *", value=active_preset.get("tags", ""))
-
-    # Construir descrição e tags otimizadas em tempo real
     raw_sections = [d_overview.strip()]
     if d_settings.strip():
         raw_sections.append(f"### Print Settings\n{d_settings.strip()}")
@@ -2613,26 +2840,6 @@ with tab_publish:
 
         st.markdown("#### 👁️ Pré-visualização Final")
         st.markdown(f"<div class='seo-card'><b>{final_pub_name or 'Título do Modelo'}</b><br><br>{final_pub_desc.replace(chr(10), '<br>')}</div>", unsafe_allow_html=True)
-
-        with st.expander("💾 Guardar como Nova Gama"):
-            new_preset_title = st.text_input("Nome da Gama", placeholder="Ex: Peças Seat Leon Mk2")
-            if st.button("Guardar Preset", use_container_width=True):
-                if new_preset_title.strip():
-                    with bot._lock:
-                        bot.presets[new_preset_title.strip()] = {
-                            "category_hint": "",
-                            "price": float(p_price),
-                            "locale": p_locale,
-                            "tags": p_tags,
-                            "overview": d_overview,
-                            "print_settings": d_settings,
-                            "assembly": d_assembly,
-                            "faq": d_faq,
-                            "license": d_license,
-                        }
-                    bot._save_state()
-                    st.success("Preset guardado!")
-                    st.rerun()
 
     st.divider()
     golden_utc = next_golden_hour_utc()
@@ -2722,7 +2929,7 @@ with tab_publish:
 
 
 # ==============================================================================
-# ABA 3: ESTÚDIO DE GESTÃO & SEO EM MASSA (BOMBASTIC & REVERSÍVEL)
+# ABA 3: ESTÚDIO DE GESTÃO & SEO EM MASSA (IA + ALGORITMO + ROLLBACK)
 # ==============================================================================
 with tab_bulk:
     if df_creations.empty:
@@ -2730,17 +2937,16 @@ with tab_bulk:
     else:
         st.subheader("⚡ Estúdio de Edição & SEO em Massa (com Backup & Rollback)")
 
-        # Filtro inteligente de seleção
         f_col1, f_col2 = st.columns([1.5, 2.5])
         quick_filter = f_col1.selectbox(
             "Seleção Rápida Inteligente",
             [
                 "Seleção Manual",
                 "Todos os Modelos",
-                "SEO Fraco (< 75/100)",
-                "Poucas Tags (< 15 tags)",
+                "SEO Fraco (abaixo de 75/100)",
+                "Poucas Tags (abaixo de 15 tags)",
                 "Muito Vistos / 0 Vendas",
-                "Preços Baixos (< 2.50)",
+                "Preços Baixos (abaixo de 2.50)",
             ],
         )
 
@@ -2753,14 +2959,14 @@ with tab_bulk:
         default_selected: List[str] = []
         if quick_filter == "Todos os Modelos":
             default_selected = all_labels
-        elif quick_filter == "SEO Fraco (< 75/100)":
+        elif "SEO Fraco" in quick_filter:
             default_selected = [k for k, v in options_map.items() if v["seo_score"] < 75]
-        elif quick_filter == "Poucas Tags (< 15 tags)":
+        elif "Poucas Tags" in quick_filter:
             default_selected = [k for k, v in options_map.items() if v["num_tags"] < 15]
-        elif quick_filter == "Muito Vistos / 0 Vendas":
+        elif "Muito Vistos" in quick_filter:
             sales_ids = set(df_sales["creation_id"].unique()) if not df_sales.empty else set()
             default_selected = [k for k, v in options_map.items() if v["views"] >= 50 and v["id"] not in sales_ids and v["preco"] > 0]
-        elif quick_filter == "Preços Baixos (< 2.50)":
+        elif "Preços Baixos" in quick_filter:
             default_selected = [k for k, v in options_map.items() if 0 < v["preco"] < 2.50]
 
         selected_labels = f_col2.multiselect(
@@ -2770,83 +2976,123 @@ with tab_bulk:
         )
 
         b_seo, b_text, b_tags, b_price = st.tabs([
-            "🧠 Auto-SEO em Massa (20 Tags + Medidas)",
+            "🧠 Auto-SEO & IA em Massa",
             "📝 Localizar/Substituir & Blocos",
             "🏷️ Gestor Cirúrgico de Tags",
             "💰 Preços Psicológicos & Promos",
         ])
 
-        # --- SUB-TAB 1: AUTO-SEO EM MASSA ---
         with b_seo:
-            st.markdown("Otimiza automaticamente títulos, medidas (mm ➔ polegadas), bloco técnico de impressão e preenche até às **20 tags ordenadas por relevância**.")
             sc1, sc2, sc3 = st.columns(3)
-            opt_imperial = sc1.checkbox("Converter mm ➔ polegadas", value=True)
-            opt_print_blk = sc2.checkbox("Injetar Print Settings se faltar", value=True)
-            opt_priority_tags = sc3.text_input("Tags prioritárias a forçar no Top 5", placeholder="ex: fsdesigns, petg")
+            use_ai_bulk = sc1.checkbox(
+                "🧠 Reescrever textos com Gemini IA (qualidade máxima)",
+                value=GeminiGrowthAI.is_configured(),
+                disabled=not GeminiGrowthAI.is_configured(),
+            )
+            opt_imperial = sc2.checkbox("Converter mm ➔ polegadas", value=True)
+            opt_priority_tags = sc3.text_input("Tags prioritárias no Top 5", placeholder="ex: fsdesigns, petg")
 
             if selected_labels:
-                preview_rows = []
-                computed_updates: List[Dict[str, Any]] = []
-                extra_t_list = [t.strip() for t in opt_priority_tags.split(",") if t.strip()]
+                if use_ai_bulk:
+                    st.info(f"Modo IA ativo: ao clicar abaixo, o Gemini vai reescrever título, descrição persuasiva e 20 tags para cada um dos {len(selected_labels)} modelo(s) selecionado(s).")
+                    if st.button(f"🧠 Reescrever & Otimizar {len(selected_labels)} Modelo(s) com IA", type="primary", use_container_width=True):
+                        prog = st.progress(0.0)
+                        done_cnt = 0
+                        extra_t_list = [t.strip().lower() for t in opt_priority_tags.split(",") if t.strip()]
+                        sales_count_lookup = df_sales.groupby("creation_id")["sale_id"].count().to_dict() if not df_sales.empty else {}
 
-                for lbl in selected_labels:
-                    row = options_map[lbl]
-                    new_n, new_d, new_t = SeoOptimizerEngine.auto_optimize_listing(
-                        row["nome"],
-                        row["descricao"],
-                        row["tags_list"],
-                        add_imperial=opt_imperial,
-                        ensure_print_block=opt_print_blk,
-                        extra_tags=extra_t_list,
-                    )
-                    new_eval = SeoOptimizerEngine.analyze_listing(new_n, new_d, new_t, row["preco"])
-                    preview_rows.append({
-                        "Modelo Atual": row["nome"],
-                        "SEO Antes": f"{row['seo_score']}/100",
-                        "SEO Depois": f"{new_eval['score']}/100",
-                        "Tags": f"{row['num_tags']} ➔ {len(new_t)}",
-                        "Top 5 Tags Novas": ", ".join(new_t[:5]),
-                    })
-                    computed_updates.append({
-                        "row": row,
-                        "new_name": new_n,
-                        "new_desc": new_d,
-                        "new_tags": new_t,
-                    })
+                        for idx_u, lbl in enumerate(selected_labels):
+                            r = options_map[lbl]
+                            try:
+                                ai_out = GeminiGrowthAI.rewrite_listing_seo(
+                                    r["nome"],
+                                    r["descricao"],
+                                    r["tags_list"],
+                                    int(r["views"]),
+                                    int(sales_count_lookup.get(r["id"], 0)),
+                                    float(r["preco"]),
+                                    currency,
+                                )
+                                new_n = ai_out.get("title") or r["nome"]
+                                new_d = ai_out.get("description") or r["descricao"]
+                                new_t = SeoOptimizerEngine.build_20_tags(
+                                    new_n, new_d, ai_out.get("tags") or r["tags_list"], extra_priority_tags=extra_t_list, max_tags=20
+                                )
+                                client.update_creation(creation_id=r["id"], name=new_n, description=new_d, tags=new_t)
+                                bot.record_action(
+                                    "BULK_IA_SEO",
+                                    r["id"],
+                                    r["nome"],
+                                    ai_out.get("summary", "Otimizado com IA"),
+                                    before_state={"name": r["nome"], "description": r["descricao"], "tags": r["tags_list"]},
+                                    after_state={"name": new_n, "description": new_d, "tags": new_t},
+                                    reversible=True,
+                                )
+                                done_cnt += 1
+                            except Exception as exc:
+                                st.error(f"Erro em '{r['nome']}': {exc}")
+                            prog.progress((idx_u + 1) / len(selected_labels))
 
-                st.dataframe(pd.DataFrame(preview_rows), use_container_width=True, hide_index=True)
+                        st.session_state.creations = client.get_all_my_creations(currency=currency)
+                        st.success(f"{done_cnt} modelo(s) reescritos pela IA com sucesso! Backup guardado no Rollback.")
+                        st.rerun()
+                else:
+                    preview_rows = []
+                    computed_updates: List[Dict[str, Any]] = []
+                    extra_t_list = [t.strip() for t in opt_priority_tags.split(",") if t.strip()]
 
-                if st.button(f"🚀 Aplicar Otimização SEO em {len(computed_updates)} Modelo(s)", type="primary", use_container_width=True):
-                    prog = st.progress(0.0)
-                    done_cnt = 0
-                    for idx_u, item_u in enumerate(computed_updates):
-                        r = item_u["row"]
-                        try:
-                            client.update_creation(
-                                creation_id=r["id"],
-                                name=item_u["new_name"],
-                                description=item_u["new_desc"],
-                                tags=item_u["new_tags"],
-                            )
-                            bot.record_action(
-                                "BULK_SEO",
-                                r["id"],
-                                r["nome"],
-                                f"Auto-SEO ({len(item_u['new_tags'])} tags)",
-                                before_state={"name": r["nome"], "description": r["descricao"], "tags": r["tags_list"]},
-                                after_state={"name": item_u["new_name"], "description": item_u["new_desc"], "tags": item_u["new_tags"]},
-                                reversible=True,
-                            )
-                            done_cnt += 1
-                        except Exception as exc:
-                            st.error(f"Erro em '{r['nome']}': {exc}")
-                        prog.progress((idx_u + 1) / len(computed_updates))
+                    for lbl in selected_labels:
+                        row = options_map[lbl]
+                        new_n, new_d, new_t = SeoOptimizerEngine.auto_optimize_listing(
+                            row["nome"],
+                            row["descricao"],
+                            row["tags_list"],
+                            add_imperial=opt_imperial,
+                            ensure_print_block=True,
+                            extra_tags=extra_t_list,
+                        )
+                        new_eval = SeoOptimizerEngine.analyze_listing(new_n, new_d, new_t, row["preco"])
+                        preview_rows.append({
+                            "Modelo Atual": row["nome"],
+                            "SEO Antes": f"{row['seo_score']}/100",
+                            "SEO Depois": f"{new_eval['score']}/100",
+                            "Tags": f"{row['num_tags']} ➔ {len(new_t)}",
+                            "Top 5 Tags Novas": ", ".join(new_t[:5]),
+                        })
+                        computed_updates.append({"row": row, "new_name": new_n, "new_desc": new_d, "new_tags": new_t})
 
-                    st.session_state.creations = client.get_all_my_creations(currency=currency)
-                    st.success(f"SEO otimizado com sucesso em {done_cnt} modelo(s)! Backup guardado no Rollback.")
-                    st.rerun()
+                    st.dataframe(pd.DataFrame(preview_rows), use_container_width=True, hide_index=True)
 
-        # --- SUB-TAB 2: LOCALIZAR/SUBSTITUIR & INJETOR DE BLOCOS ---
+                    if st.button(f"🚀 Aplicar Otimização Rápida em {len(computed_updates)} Modelo(s)", type="primary", use_container_width=True):
+                        prog = st.progress(0.0)
+                        done_cnt = 0
+                        for idx_u, item_u in enumerate(computed_updates):
+                            r = item_u["row"]
+                            try:
+                                client.update_creation(
+                                    creation_id=r["id"],
+                                    name=item_u["new_name"],
+                                    description=item_u["new_desc"],
+                                    tags=item_u["new_tags"],
+                                )
+                                bot.record_action(
+                                    "BULK_SEO",
+                                    r["id"],
+                                    r["nome"],
+                                    f"Auto-SEO ({len(item_u['new_tags'])} tags)",
+                                    before_state={"name": r["nome"], "description": r["descricao"], "tags": r["tags_list"]},
+                                    after_state={"name": item_u["new_name"], "description": item_u["new_desc"], "tags": item_u["new_tags"]},
+                                    reversible=True,
+                                )
+                                done_cnt += 1
+                            except Exception as exc:
+                                st.error(f"Erro em '{r['nome']}': {exc}")
+                            prog.progress((idx_u + 1) / len(computed_updates))
+
+                        st.session_state.creations = client.get_all_my_creations(currency=currency)
+                        st.success(f"SEO otimizado em {done_cnt} modelo(s)!")
+                        st.rerun()
+
         with b_text:
             tx_c1, tx_c2 = st.columns(2)
             with tx_c1:
@@ -2909,7 +3155,6 @@ with tab_bulk:
                     st.success(f"Bloco aplicado em {cnt_blk} modelo(s)!")
                     st.rerun()
 
-        # --- SUB-TAB 3: GESTOR CIRÚRGICO DE TAGS ---
         with b_tags:
             tag_action = st.radio(
                 "Operação de Tags",
@@ -2945,7 +3190,6 @@ with tab_bulk:
                 st.success(f"Tags atualizadas em {t_cnt} modelo(s)!")
                 st.rerun()
 
-        # --- SUB-TAB 4: PREÇOS PSICOLÓGICOS & PROMOÇÕES ---
         with b_price:
             pc1, pc2 = st.columns(2)
             with pc1:
@@ -3061,7 +3305,7 @@ with tab_bot:
             s_c1, s_c2, s_c3, s_c4 = st.columns(4)
             in_r_sales = s_c1.checkbox("Alertar Vendas", value=bool(cfg["rule_sales_alert"]))
             in_r_postsale = s_c2.checkbox("Script Pós-Venda", value=bool(cfg["rule_post_sale_script"]))
-            in_r_social = s_c3.checkbox("Kit Social (Reddit/IG)", value=bool(cfg["rule_social_kit"]))
+            in_r_social = s_c3.checkbox("Kit Social IA (Reddit/IG)", value=bool(cfg["rule_social_kit"]))
             in_r_mile = s_c4.checkbox("Celebrar Marcos", value=bool(cfg["rule_milestone_alert"]))
 
             st.divider()
@@ -3175,7 +3419,7 @@ with tab_bot:
 
         c_t1, c_t2, c_t3 = st.columns(3)
         if c_t1.button("🔔 Testar Telegram/Discord", use_container_width=True):
-            bot.send_notification("✅ <b>Cults3D Studio Pro v5:</b> Notificações operacionais!")
+            bot.send_notification("✅ <b>Cults3D Studio Pro v6:</b> Notificações e IA operacionais!")
             st.toast("Notificação enviada!")
         if c_t2.button("🛡️ Testar Ping Anti-Sleep", use_container_width=True):
             bot.ping_keep_alive()
@@ -3266,10 +3510,10 @@ with tab_bot:
     with sub_tg:
         st.markdown(
             """
-            - `/status` — Estado do bot, Anti-Sleep, último ciclo e quota da API.
+            - `/status` — Estado do bot, Gemini IA, Anti-Sleep, último ciclo e quota da API.
             - `/vendas` — Últimas 5 vendas com receita líquida e comprador.
             - `/top` — Top 5 modelos mais vistos e downloads.
-            - `/kit` — Post pronto a copiar/colar para o teu modelo mais visto.
+            - `/kit` — Post gerado por IA pronto a copiar/colar para o teu modelo mais visto.
             - `/ciclo` — Força um ciclo completo imediato.
             - `/pausar` e `/retomar` — Pausa ou volta a ligar o bot pelo telemóvel.
             """
@@ -3339,17 +3583,17 @@ with tab_bot:
 
 
 # ==============================================================================
-# ABA 5: RADAR DE MERCADO & EXTRATOR DE N-GRAMS
+# ABA 5: RADAR DE MERCADO, N-GRAMS & CONSULTOR IA
 # ==============================================================================
 with tab_market:
-    st.subheader("🔍 Radar de Nichos & Mineração de Keywords (N-Grams)")
+    st.subheader("🔍 Radar de Nichos, Mineração N-Gram & Consultor IA")
     r_c1, r_c2, r_c3, r_c4 = st.columns([2.5, 1.2, 1, 1])
     m_query = r_c1.text_input("Nicho / Palavra-chave *", placeholder="Ex: seat leon, gauge pod, trim clip")
     m_price_filter = r_c2.selectbox("Filtro", ["Apenas Pagos", "Todos (Pagos + Grátis)", "Apenas Gratuitos"])
     m_limit = r_c3.number_input("Amostra", 10, 100, 40, 10)
     m_sort = r_c4.selectbox("Ordenar por", ["Receita Estimada", "Downloads", "Likes", "Views", "Preço"])
 
-    if st.button("🔎 Analisar & Extrair Keywords", type="primary") and m_query.strip():
+    if st.button("🔎 Analisar Nicho + Consultar IA", type="primary") and m_query.strip():
         with st.spinner(f"A minerar dados de '{m_query.strip()}'..."):
             try:
                 raw_search = client.search_market(
@@ -3407,12 +3651,29 @@ with tab_market:
                     mk4.metric("Média Downloads", f"{avg_dl:.1f}")
                     mk5.metric("Receita Est. Amostra", f"{tot_rev:,.2f} {currency}")
 
+                    bigrams = extract_ngrams(top_titles or df_m["nome"].tolist(), n=2, top_k=8)
+                    trigrams = extract_ngrams(top_titles or df_m["nome"].tolist(), n=3, top_k=5)
+
+                    if GeminiGrowthAI.is_configured():
+                        try:
+                            ai_advice = GeminiGrowthAI.analyze_niche_strategy(
+                                keyword=m_query.strip(),
+                                total_listings=int(total_in_cults),
+                                avg_price=avg_p,
+                                med_price=med_p,
+                                avg_dl=avg_dl,
+                                top_titles=top_titles or df_m["nome"].tolist(),
+                                bigrams=[g for g, _ in bigrams],
+                                currency=currency,
+                            )
+                            st.markdown(f"<div class='ai-card'><b>🧠 Diagnóstico Estratégico Gemini IA:</b><br><br>{ai_advice.replace(chr(10), '<br>')}</div>", unsafe_allow_html=True)
+                        except Exception as ai_exc:
+                            st.caption(f"Nota IA: {ai_exc}")
+
                     st.divider()
                     ng1, ng2 = st.columns(2)
                     with ng1:
                         st.markdown("#### 🧠 Combinações de Palavras dos Líderes (N-Grams)")
-                        bigrams = extract_ngrams(top_titles or df_m["nome"].tolist(), n=2, top_k=8)
-                        trigrams = extract_ngrams(top_titles or df_m["nome"].tolist(), n=3, top_k=5)
                         if bigrams:
                             st.write("**Expressões de 2 palavras mais lucrativas:**")
                             st.code(", ".join(f"{g} ({c}x)" for g, c in bigrams), language=None)
