@@ -1,5 +1,6 @@
 from collections import Counter
 from datetime import datetime, timedelta, timezone
+from fractions import Fraction
 import json
 import os
 import re
@@ -11,7 +12,7 @@ import requests
 import streamlit as st
 
 st.set_page_config(
-    page_title="Cults3D Studio Pro & Growth Bot",
+    page_title="Cults3D Studio Pro v5 — Growth & SEO",
     page_icon="🧊",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -24,7 +25,7 @@ st.markdown(
     """
     <style>
     .block-container {
-        padding-top: 1.4rem;
+        padding-top: 1.3rem;
         padding-bottom: 2rem;
     }
     div[data-testid="stMetric"] {
@@ -52,6 +53,14 @@ st.markdown(
         padding: 14px 18px;
         margin-bottom: 12px;
     }
+    .upload-badge {
+        background-color: rgba(0, 168, 232, 0.12);
+        border: 1px solid rgba(0, 168, 232, 0.35);
+        border-radius: 6px;
+        padding: 6px 10px;
+        font-size: 0.85rem;
+        margin-bottom: 6px;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -59,7 +68,7 @@ st.markdown(
 
 
 # ==============================================================================
-# UTILITÁRIOS GRAPHQL, SECRETS & PERSISTÊNCIA
+# UTILITÁRIOS GERAIS, SECRETS & PERSISTÊNCIA
 # ==============================================================================
 class CultsAPIError(Exception):
     pass
@@ -109,16 +118,278 @@ def next_golden_hour_utc() -> datetime:
     candidates: List[datetime] = []
     for days_ahead in range(0, 8):
         day_dt = now_local + timedelta(days=days_ahead)
-        if day_dt.weekday() == 4:  # Sexta-feira 18:00
+        if day_dt.weekday() == 4:
             cand = day_dt.replace(hour=18, minute=0, second=0, microsecond=0)
             if cand > now_local + timedelta(minutes=15):
                 candidates.append(cand)
-        elif day_dt.weekday() == 6:  # Domingo 15:00
+        elif day_dt.weekday() == 6:
             cand = day_dt.replace(hour=15, minute=0, second=0, microsecond=0)
             if cand > now_local + timedelta(minutes=15):
                 candidates.append(cand)
     chosen = min(candidates) if candidates else (now_local + timedelta(hours=2))
     return chosen.astimezone(timezone.utc)
+
+
+# ==============================================================================
+# CLOUD ASSET UPLOADER (PONTE DRAG & DROP -> HTTPS DIRETO PARA CULTS3D)
+# ==============================================================================
+class CloudAssetUploader:
+    """Carrega ficheiros locais (imagens e STL/3MF) para alojamento HTTPS direto
+    para que o Cults3D os importe automaticamente via GraphQL sem configuração externa.
+    """
+
+    @staticmethod
+    def upload_bytes(file_bytes: bytes, filename: str, mime_type: str = "application/octet-stream") -> str:
+        errors: List[str] = []
+
+        # 1. Catbox.moe (Link direto permanente até 200MB)
+        try:
+            resp = requests.post(
+                "https://catbox.moe/user/api.php",
+                data={"reqtype": "fileupload"},
+                files={"fileToUpload": (filename, file_bytes, mime_type)},
+                timeout=45,
+            )
+            if resp.status_code == 200:
+                url = resp.text.strip()
+                if url.startswith("https://"):
+                    return url
+            errors.append(f"Catbox ({resp.status_code})")
+        except Exception as exc:
+            errors.append(f"Catbox ({exc})")
+
+        # 2. Litterbox (Link direto 24h — suficiente para ingestão imediata pelo Cults3D)
+        try:
+            resp = requests.post(
+                "https://litterbox.catbox.moe/resources/internals/api.php",
+                data={"reqtype": "fileupload", "time": "24h"},
+                files={"fileToUpload": (filename, file_bytes, mime_type)},
+                timeout=45,
+            )
+            if resp.status_code == 200:
+                url = resp.text.strip()
+                if url.startswith("https://"):
+                    return url
+            errors.append(f"Litterbox ({resp.status_code})")
+        except Exception as exc:
+            errors.append(f"Litterbox ({exc})")
+
+        # 3. Tmpfiles.org (Fallback com conversão para link /dl/)
+        try:
+            resp = requests.post(
+                "https://tmpfiles.org/api/v1/upload",
+                files={"file": (filename, file_bytes, mime_type)},
+                timeout=45,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                raw_url = ((data.get("data") or {}).get("url") or "").strip()
+                if raw_url.startswith("http"):
+                    direct = raw_url.replace("http://", "https://").replace("tmpfiles.org/", "tmpfiles.org/dl/", 1)
+                    return direct
+            errors.append(f"Tmpfiles ({resp.status_code})")
+        except Exception as exc:
+            errors.append(f"Tmpfiles ({exc})")
+
+        raise CultsAPIError(f"Falha ao hospedar '{filename}' na cloud: {', '.join(errors)}")
+
+
+# ==============================================================================
+# MOTOR DE SEO & OTIMIZAÇÃO DE CONVERSÃO (20 TAGS + DUPLA UNIDADE + AUDITORIA)
+# ==============================================================================
+class SeoOptimizerEngine:
+    STOPWORDS = {
+        "the", "and", "for", "with", "from", "into", "that", "this", "your",
+        "para", "com", "sem", "por", "uma", "uns", "das", "dos", "que",
+        "file", "files", "download", "model", "part", "parts", "piece",
+    }
+
+    BASE_3D_TAGS = [
+        "3d print", "stl", "functional print", "3d printing", "replacement part",
+        "custom part", "diy", "maker", "3d model", "printable",
+    ]
+
+    @staticmethod
+    def mm_to_imperial_hint(mm_val: float) -> str:
+        inches = mm_val / 25.4
+        if inches < 1.0:
+            frac = Fraction(inches).limit_denominator(16)
+            if frac.numerator > 0 and abs(float(frac) - inches) <= 0.025:
+                return f'{frac.numerator}/{frac.denominator}"'
+        return f'{inches:.2f}"'
+
+    @classmethod
+    def enrich_metric_units(cls, text: str) -> str:
+        """Adiciona equivalência em polegadas junto a medidas em mm (ex: 8mm -> 8mm (5/16\")) se ainda não existir."""
+        if not text:
+            return text
+
+        def _repl(match: re.Match) -> str:
+            full = match.group(0)
+            num_str = match.group(1).replace(",", ".")
+            after = text[match.end(): match.end() + 14]
+            if '"' in after or "inch" in after.lower() or "in)" in after.lower():
+                return full
+            try:
+                val = float(num_str)
+                if 1.0 <= val <= 500.0:
+                    imp = cls.mm_to_imperial_hint(val)
+                    return f"{full} ({imp})"
+            except ValueError:
+                pass
+            return full
+
+        return re.sub(r"\b(\d+(?:[.,]\d+)?)\s?mm\b", _repl, text, flags=re.IGNORECASE)
+
+    @classmethod
+    def extract_priority_keywords(cls, title: str, description: str = "") -> List[str]:
+        """Extrai termos de alto impacto do título (peso 2x) e descrição para liderarem as tags."""
+        title_tokens = [
+            w for w in re.findall(r"[a-z0-9À-ÿ\-]{2,}", title.lower())
+            if w not in cls.STOPWORDS and not w.isdigit()
+        ]
+        bigrams: List[str] = []
+        if len(title_tokens) >= 2:
+            for i in range(len(title_tokens) - 1):
+                bg = f"{title_tokens[i]} {title_tokens[i + 1]}"
+                bigrams.append(bg)
+
+        desc_tokens = [
+            w for w in re.findall(r"[a-z0-9À-ÿ]{3,}", description.lower())
+            if w not in cls.STOPWORDS and not w.isdigit()
+        ]
+        common_desc = [w for w, _ in Counter(desc_tokens).most_common(12)]
+
+        ordered: List[str] = []
+        for item in bigrams[:4] + title_tokens + common_desc:
+            clean = item.strip("- ").lower()
+            if len(clean) >= 2 and clean not in ordered:
+                ordered.append(clean)
+        return ordered
+
+    @classmethod
+    def build_20_tags(
+        cls,
+        title: str,
+        description: str,
+        existing_tags: List[str],
+        extra_priority_tags: Optional[List[str]] = None,
+        max_tags: int = 20,
+    ) -> List[str]:
+        """Constrói até 20 tags ordenadas por relevância (Top 5 com palavras do título)."""
+        priority_from_title = cls.extract_priority_keywords(title, description)
+        clean_existing = [t.strip().lower() for t in existing_tags if t.strip()]
+        clean_extra = [t.strip().lower() for t in (extra_priority_tags or []) if t.strip()]
+
+        # Ordem de peso: Tags extra prioritárias -> Keywords do título -> Tags atuais -> Base 3D
+        pool = clean_extra + priority_from_title + clean_existing + cls.BASE_3D_TAGS
+        final_tags: List[str] = []
+        for tag in pool:
+            if tag and tag not in final_tags:
+                final_tags.append(tag)
+            if len(final_tags) >= max_tags:
+                break
+        return final_tags
+
+    @classmethod
+    def analyze_listing(cls, name: str, description: str, tags: List[str], price: float) -> Dict[str, Any]:
+        score = 0
+        tips: List[str] = []
+
+        n_len = len(name.strip())
+        if n_len >= 28:
+            score += 25
+        elif n_len >= 14:
+            score += 15
+            tips.append("Alonga o título para 28–75 caracteres com modelo, medidas (mm) e aplicação.")
+        else:
+            tips.append("Título demasiado curto. Inclui palavras-chave específicas pesquisadas pelos compradores.")
+
+        d_len = len(description.strip())
+        if d_len >= 300:
+            score += 20
+        elif d_len >= 120:
+            score += 12
+            tips.append("Expande a descrição (> 300 caracteres) com tolerâncias, montagem e vantagens.")
+        else:
+            tips.append("Descrição muito curta. O motor de busca favorece descrições técnicas completas.")
+
+        desc_lower = description.lower()
+        if any(k in desc_lower for k in ("infill", "layer", "support", "petg", "pla", "abs", "asa", "nozzle", "parede", "camada")):
+            score += 15
+        else:
+            tips.append("Adiciona definições de impressão (material, altura de camada, infill e suportes).")
+
+        clean_tags = [t.strip().lower() for t in tags if t.strip()]
+        if len(clean_tags) >= 15:
+            score += 30
+        elif len(clean_tags) >= 8:
+            score += 20
+            tips.append(f"Tens {len(clean_tags)}/20 tags. Preencher até 20 tags aumenta as impressões orgânicas.")
+        else:
+            score += 6
+            tips.append(f"Apenas {len(clean_tags)}/20 tags! Usa todas as 20 tags disponíveis.")
+
+        if price == 0 or (round(price * 100) % 50 == 0 or str(f"{price:.2f}").endswith(("9", "5", "0"))):
+            score += 10
+        else:
+            score += 6
+
+        suggested_tags = cls.build_20_tags(name, description, clean_tags, max_tags=20)
+        missing_tags = [t for t in suggested_tags if t not in clean_tags]
+
+        return {
+            "score": min(100, score),
+            "tips": tips,
+            "tag_count": len(clean_tags),
+            "suggested_tags": suggested_tags,
+            "missing_tags": missing_tags[:10],
+        }
+
+    @classmethod
+    def auto_optimize_listing(
+        cls,
+        name: str,
+        description: str,
+        tags: List[str],
+        add_imperial: bool = True,
+        ensure_print_block: bool = True,
+        extra_tags: Optional[List[str]] = None,
+    ) -> Tuple[str, str, List[str]]:
+        new_name = name.strip()
+        new_desc = description.strip()
+
+        if add_imperial:
+            new_name = cls.enrich_metric_units(new_name)
+            new_desc = cls.enrich_metric_units(new_desc)
+
+        if ensure_print_block and not any(
+            k in new_desc.lower() for k in ("print settings", "infill", "layer height", "petg", "pla", "abs", "asa")
+        ):
+            new_desc = (
+                f"{new_desc}\n\n"
+                "### Recommended 3D Print Settings\n"
+                "- Material: PETG, ASA or ABS for mechanical/heat durability (PLA+ for indoor use)\n"
+                "- Layer Height: 0.20 mm | Nozzle: 0.40 mm\n"
+                "- Infill: 25%–40% Gyroid | Walls: 3–4 perimeters"
+            ).strip()
+
+        new_tags = cls.build_20_tags(new_name, new_desc, tags, extra_priority_tags=extra_tags, max_tags=20)
+        return new_name, new_desc, new_tags
+
+
+def extract_ngrams(titles: List[str], n: int = 2, top_k: int = 10) -> List[Tuple[str, int]]:
+    stopwords = {"the", "and", "for", "with", "stl", "file", "print", "3d", "model", "part", "from"}
+    grams: List[str] = []
+    for title in titles:
+        tokens = [
+            w for w in re.findall(r"[a-z0-9]{2,}", title.lower())
+            if w not in stopwords
+        ]
+        if len(tokens) >= n:
+            for i in range(len(tokens) - n + 1):
+                grams.append(" ".join(tokens[i:i + n]))
+    return Counter(grams).most_common(top_k)
 
 
 # ==============================================================================
@@ -787,48 +1058,38 @@ class CultsBotEngine:
         "tg_chat_id": "",
         "tg_remote_commands": True,
         "discord_webhook": "",
-        # 1. Vendas, Marcos & Assistente Pós-Venda
         "rule_sales_alert": True,
         "rule_milestone_alert": True,
         "rule_post_sale_script": True,
         "rule_social_kit": True,
-        # 2. Picos de Tráfego
         "rule_spike_alert": True,
         "spike_views_threshold": 35,
-        # 3. Auto-Promo (0 Vendas)
         "rule_auto_promo": False,
         "promo_min_views": 120,
         "promo_discount_pct": 20,
         "promo_days": 3,
         "promo_cooldown_days": 14,
-        # 4. Reativação de Modelos Estagnados
         "rule_stagnant_revival": False,
         "stagnant_days": 30,
         "stagnant_discount_pct": 25,
         "stagnant_promo_days": 3,
-        # 5. Preço Dinâmico por Procura
         "rule_dynamic_price": False,
         "price_step_sales": 10,
         "price_bump_pct": 15.0,
         "price_max_cap": 15.0,
-        # 6. Promoção Relâmpago de Fim de Semana
         "rule_weekend_flash": False,
         "weekend_day": 4,
         "weekend_hour": 18,
         "weekend_discount_pct": 20,
         "weekend_days": 3,
-        # 7. Vitrine Dinâmica de Cross-Selling
         "rule_dynamic_showcase": False,
         "showcase_top_n": 3,
         "showcase_title": "Top Popular Designs by FSDesigns:",
-        # 8. Otimizador SEO & Rodapé
         "rule_seo_optimizer": False,
         "seo_footer_marker": "--- FSDesigns ---",
         "seo_footer_text": "\n\n--- FSDesigns ---\nDesigned for reliable 3D printing (PETG / ABS / ASA recommended for automotive parts). Follow our profile for new functional designs!",
         "seo_required_tags": "stl, 3d print",
-        # 9. Fila de Publicação Agendada
         "rule_queue_publisher": True,
-        # 10. Radar de Nichos & Relatórios
         "rule_market_watch": False,
         "watch_keywords": "",
         "rule_daily_report": True,
@@ -861,7 +1122,7 @@ class CultsBotEngine:
         },
         "Organização & Oficina (PLA / PETG)": {
             "category_hint": "tool",
-            "price": 2.00,
+            "price": 2.90,
             "locale": "EN",
             "tags": "organizer, holder, mount, workshop, tool, functional, storage, stl",
             "overview": "Heavy-duty organizer and mount engineered for clean workspace storage and fast printing.",
@@ -1127,7 +1388,6 @@ class CultsBotEngine:
                 self.log("ERRO", f"Falha Discord: {exc}")
 
     def ping_keep_alive(self):
-        """Envia ping HTTP para o próprio URL público do Streamlit Cloud para impedir hibernação."""
         with self._lock:
             if not self.config.get("anti_sleep_enabled", True):
                 self.keepalive_status = "Desativado"
@@ -1199,7 +1459,7 @@ class CultsBotEngine:
                     state_lbl = "🟢 ATIVO" if self.running else "🔴 PAUSADO"
                     mode_lbl = "🧪 Simulação" if self.config.get("dry_run") else "⚡ Real"
                     self.send_notification(
-                        f"🤖 <b>Estado Cults3D Studio Pro</b>\n"
+                        f"🤖 <b>Estado Cults3D Studio Pro v5</b>\n"
                         f"Estado: {state_lbl} ({mode_lbl})\n"
                         f"Anti-Sleep: {self.keepalive_status}\n"
                         f"Último ciclo: {self.last_run or 'Nunca'}\n"
@@ -1269,7 +1529,6 @@ class CultsBotEngine:
         self.log("INFO", "Bot contínuo parado.")
 
     def _loop(self):
-        # Ping inicial imediato ao arrancar
         self.ping_keep_alive()
         while True:
             with self._lock:
@@ -1283,10 +1542,8 @@ class CultsBotEngine:
                 with self._lock:
                     if not self.running:
                         return
-                # Auto-ping a cada 4 minutos (240s) para impedir hibernação do servidor
                 if step > 0 and step % 240 == 0:
                     self.ping_keep_alive()
-                # Escutar comandos Telegram a cada 6 segundos
                 if step % 6 == 0:
                     self.poll_telegram_commands()
                 time.sleep(1)
@@ -1323,9 +1580,6 @@ class CultsBotEngine:
             mode_tag = "[SIMULAÇÃO]" if dry else "[REAL]"
             self.log("CICLO", f"A iniciar ciclo autónomo {mode_tag}...")
 
-            # ------------------------------------------------------------------
-            # 1. VENDAS, MARCOS & ASSISTENTE PÓS-VENDA
-            # ------------------------------------------------------------------
             sales = client.get_all_my_sales(currency=curr)
             sales_count_map: Dict[str, int] = {}
             sales_rev_map: Dict[str, float] = {}
@@ -1395,14 +1649,10 @@ class CultsBotEngine:
                     with self._lock:
                         self.seen_sale_ids = list(seen_set)
 
-            # ------------------------------------------------------------------
-            # 2. CATÁLOGO: TRÁFEGO, EARLY-BIRD, TESTES A/B, PROMOS, VITRINE & SEO
-            # ------------------------------------------------------------------
             creations = client.get_all_my_creations(currency=curr)
             self.seed_baselines_if_needed(creations)
             spike_alerts: List[str] = []
 
-            # Preparar Vitrine Dinâmica (Top N mais vistos com URL válido)
             showcase_block = ""
             top_showcase_ids = set()
             if cfg.get("rule_dynamic_showcase") and len(creations) > 1:
@@ -1443,7 +1693,6 @@ class CultsBotEngine:
                 csales = sales_count_map.get(cid, 0)
                 crev = sales_rev_map.get(cid, 0.0)
 
-                # --- Pico de Tráfego ---
                 prev_snap = self.model_snapshots.get(cid)
                 if cfg.get("rule_spike_alert") and prev_snap:
                     delta_views = cviews - int(prev_snap.get("views", cviews))
@@ -1459,7 +1708,7 @@ class CultsBotEngine:
                         "sales": csales,
                     }
 
-                # --- Preço Early-Bird de Lançamento ---
+                # Early-Bird
                 eb_rule = self.early_bird_rules.get(cid)
                 if eb_rule and not eb_rule.get("completed") and actions_done < max_actions:
                     target_s = int(eb_rule.get("target_sales", 3))
@@ -1487,7 +1736,7 @@ class CultsBotEngine:
                         except Exception:
                             pass
 
-                # --- Teste A/B de Preço por RPM ---
+                # Teste A/B por RPM
                 ab = self.ab_tests.get(cid)
                 if ab and ab.get("phase") in ("A", "B") and actions_done < max_actions:
                     try:
@@ -1533,7 +1782,7 @@ class CultsBotEngine:
                     except Exception as exc:
                         self.log("ERRO", f"Falha Teste A/B em '{cname}': {exc}")
 
-                # --- Auto-Promo Inteligente (0 Vendas) ---
+                # Auto-Promo (0 Vendas)
                 if (
                     actions_done < max_actions
                     and cfg.get("rule_auto_promo")
@@ -1569,7 +1818,7 @@ class CultsBotEngine:
                                 ).strftime("%Y-%m-%dT%H:%M:%SZ")
                             self.log("AVISO", f"Auto-Promo ignorada em '{cname}': {exc}")
 
-                # --- Reativação de Modelos Estagnados ---
+                # Reativação Estagnados
                 if (
                     actions_done < max_actions
                     and cfg.get("rule_stagnant_revival")
@@ -1599,7 +1848,7 @@ class CultsBotEngine:
                         except Exception:
                             pass
 
-                # --- Preço Dinâmico por Procura ---
+                # Preço Dinâmico
                 if (
                     actions_done < max_actions
                     and cfg.get("rule_dynamic_price")
@@ -1630,7 +1879,7 @@ class CultsBotEngine:
                                 except Exception as exc:
                                     self.log("ERRO", f"Falha preço em '{cname}': {exc}")
 
-                # --- Promoção Relâmpago de Fim de Semana ---
+                # Flash Fim de Semana
                 if trigger_weekend_flash and cprice > 0 and not self._is_in_promo_cooldown(cid):
                     w_pct = int(cfg.get("weekend_discount_pct", 20))
                     w_days = int(cfg.get("weekend_days", 3))
@@ -1646,7 +1895,7 @@ class CultsBotEngine:
                         except Exception:
                             pass
 
-                # --- Vitrine Dinâmica & Otimizador SEO/Rodapé (combinados numa única chamada updateCreation) ---
+                # Vitrine Dinâmica & SEO
                 new_desc_candidate = cdesc
                 desc_modified = False
 
@@ -1676,12 +1925,11 @@ class CultsBotEngine:
                         new_desc_candidate = (new_desc_candidate.rstrip() + footer).strip()
                         desc_modified = True
 
-                    norm_tags = list(dict.fromkeys([t.strip().lower() for t in ctags if t.strip()]))
-                    for rt in req_tags:
-                        if rt not in norm_tags:
-                            norm_tags.append(rt)
-                    if norm_tags != ctags:
-                        new_tags_candidate = norm_tags
+                    enriched_tags = SeoOptimizerEngine.build_20_tags(
+                        cname, new_desc_candidate, ctags, extra_priority_tags=req_tags, max_tags=20
+                    )
+                    if enriched_tags != ctags:
+                        new_tags_candidate = enriched_tags
                         tags_modified = True
 
                     if not desc_modified and not tags_modified:
@@ -1726,9 +1974,7 @@ class CultsBotEngine:
                 self.log("TRÁFEGO", f"{len(spike_alerts)} modelo(s) com pico de tráfego!")
                 self.send_notification("🚀 <b>Pico de Tráfego Detetado!</b>\n" + "\n".join(spike_alerts[:6]))
 
-            # ------------------------------------------------------------------
-            # 3. FILA DE PUBLICAÇÃO AGENDADA + KIT DE DIVULGAÇÃO
-            # ------------------------------------------------------------------
+            # Fila de Publicação Agendada
             if cfg.get("rule_queue_publisher", True) and self.publish_queue:
                 now_utc = datetime.now(timezone.utc)
                 with self._lock:
@@ -1777,9 +2023,7 @@ class CultsBotEngine:
                                 self.log("ERRO", f"Falha ao publicar '{item['name']}': {exc}")
                         break
 
-            # ------------------------------------------------------------------
-            # 4. RADAR DE NICHOS & OPORTUNIDADES DE COMENTÁRIO
-            # ------------------------------------------------------------------
+            # Radar de Nichos
             keywords = [k.strip() for k in str(cfg.get("watch_keywords", "")).split(",") if k.strip()]
             if cfg.get("rule_market_watch") and keywords:
                 seen_m = set(self.seen_market_ids)
@@ -1814,9 +2058,7 @@ class CultsBotEngine:
                         + "\n".join(found_new_items[:5])
                     )
 
-            # ------------------------------------------------------------------
-            # 5. RELATÓRIOS DIÁRIO & SEMANAL
-            # ------------------------------------------------------------------
+            # Relatórios Diário & Semanal
             local_date_str = now_local.strftime("%Y-%m-%d")
             total_v = sum(int(c.get("viewsCount") or 0) for c in creations)
             total_d = sum(int(c.get("downloadsCount") or 0) for c in creations)
@@ -1876,18 +2118,18 @@ class CultsBotEngine:
 
 
 @st.cache_resource
-def get_bot_engine(version: str = "studio_pro_v4") -> CultsBotEngine:
+def get_bot_engine(version: str = "studio_pro_v5") -> CultsBotEngine:
     return CultsBotEngine()
 
 
-bot = get_bot_engine("studio_pro_v4")
+bot = get_bot_engine("studio_pro_v5")
 if not hasattr(bot, "ping_keep_alive"):
     try:
         bot.stop()
     except Exception:
         pass
     get_bot_engine.clear()
-    bot = get_bot_engine("studio_pro_v4")
+    bot = get_bot_engine("studio_pro_v5")
 
 # Arranque automático via Secrets (Cloud 24/7)
 _srv_user = get_secret_val("CULTS_USERNAME")
@@ -1902,77 +2144,6 @@ if _srv_user and _srv_key:
 if st.query_params.get("health") == "1":
     st.write("OK")
     st.stop()
-
-
-# ==============================================================================
-# MOTOR DE SEO & ANÁLISE DE QUALIDADE
-# ==============================================================================
-def analyze_listing_seo(name: str, description: str, tags: List[str], price: float) -> Dict[str, Any]:
-    score = 0
-    tips: List[str] = []
-
-    n_len = len(name.strip())
-    if n_len >= 25:
-        score += 25
-    elif n_len >= 12:
-        score += 15
-        tips.append("Alonga o título para 25–60 caracteres com modelo/dimensões (ex: '52mm', 'Mk2', 'Print-in-Place').")
-    else:
-        tips.append("Título demasiado curto. Inclui palavras-chave específicas que os compradores pesquisam.")
-
-    d_len = len(description.strip())
-    if d_len >= 250:
-        score += 20
-    elif d_len >= 100:
-        score += 12
-        tips.append("Expande a descrição (ideal > 250 caracteres) detalhando vantagens e montagem.")
-    else:
-        tips.append("Descrição muito curta. O algoritmo do Cults3D favorece descrições completas.")
-
-    desc_lower = description.lower()
-    if any(k in desc_lower for k in ("infill", "layer", "support", "petg", "pla", "abs", "asa", "nozzle")):
-        score += 15
-    else:
-        tips.append("Adiciona parâmetros de impressão (material recomendado, altura de camada, suportes e infill).")
-
-    clean_tags = [t.strip().lower() for t in tags if t.strip()]
-    if len(clean_tags) >= 8:
-        score += 30
-    elif len(clean_tags) >= 5:
-        score += 20
-        tips.append(f"Tens {len(clean_tags)} tags. Adiciona pelo menos 8 a 12 tags relevantes para maximizar o alcance.")
-    else:
-        score += 5
-        tips.append("Poucas tags! Usa entre 8 e 15 tags (sinónimos, aplicações, material e categoria).")
-
-    if price == 0 or (round(price * 100) % 50 == 0 or str(price).endswith(("9", "5"))):
-        score += 10
-    else:
-        score += 6
-
-    stopwords = {"the", "and", "for", "with", "para", "com", "de", "do", "da", "em", "stl", "3d"}
-    words = re.findall(r"[a-zA-Z0-9À-ÿ]{3,}", name.lower())
-    suggested_tags = [w for w in dict.fromkeys(words) if w not in stopwords and w not in clean_tags][:8]
-
-    return {
-        "score": min(100, score),
-        "tips": tips,
-        "suggested_tags": suggested_tags,
-    }
-
-
-def extract_ngrams(titles: List[str], n: int = 2, top_k: int = 10) -> List[Tuple[str, int]]:
-    stopwords = {"the", "and", "for", "with", "stl", "file", "print", "3d", "model", "part", "from"}
-    grams: List[str] = []
-    for title in titles:
-        tokens = [
-            w for w in re.findall(r"[a-z0-9]{2,}", title.lower())
-            if w not in stopwords
-        ]
-        if len(tokens) >= n:
-            for i in range(len(tokens) - n + 1):
-                grams.append(" ".join(tokens[i:i + n]))
-    return Counter(grams).most_common(top_k)
 
 
 # ==============================================================================
@@ -2018,9 +2189,9 @@ if not st.session_state.connected:
     st.markdown("<br>", unsafe_allow_html=True)
     _, center_col, _ = st.columns([1, 2, 1])
     with center_col:
-        st.title("🧊 Cults3D Studio Pro")
+        st.title("🧊 Cults3D Studio Pro v5")
         st.write(
-            "Plataforma completa de Business Intelligence, Growth Engine, Radar N-Gram e Bot Autónomo 24/7 com Anti-Sleep."
+            "Plataforma completa de Business Intelligence, Upload Drag & Drop, Estúdio SEO em Massa e Bot Autónomo 24/7."
         )
 
         with st.form("login_form"):
@@ -2028,26 +2199,18 @@ if not st.session_state.connected:
                 "Username Cults3D",
                 value=st.session_state.username,
                 placeholder="Ex: FSDesigns",
-                help="O teu nome de utilizador público (nick) no Cults3D.",
             )
             in_key = st.text_input(
                 "API Key",
                 value=st.session_state.api_key,
                 type="password",
                 placeholder="Cola aqui a tua API Key",
-                help="A chave gerada nas definições da tua conta Cults3D (secção API).",
             )
-            in_curr = st.selectbox(
-                "Moeda principal",
-                ["EUR", "USD", "GBP"],
-                index=0,
-                help="Moeda usada para calcular receitas, preços e análises de mercado.",
-            )
+            in_curr = st.selectbox("Moeda principal", ["EUR", "USD", "GBP"], index=0)
             submit_login = st.form_submit_button(
                 "🔌 Ligar e Sincronizar Conta",
                 type="primary",
                 use_container_width=True,
-                help="Autentica na API GraphQL do Cults3D e carrega todo o teu catálogo e vendas.",
             )
 
         if submit_login:
@@ -2095,12 +2258,7 @@ with st.sidebar:
     else:
         st.caption("🤖 Bot: Parado")
 
-    new_curr = st.selectbox(
-        "Moeda",
-        ["EUR", "USD", "GBP"],
-        index=["EUR", "USD", "GBP"].index(currency),
-        help="Altera a moeda de visualização e recarrega os valores convertidos pela API.",
-    )
+    new_curr = st.selectbox("Moeda", ["EUR", "USD", "GBP"], index=["EUR", "USD", "GBP"].index(currency))
     if new_curr != currency:
         st.session_state.currency = new_curr
         bot.set_credentials(st.session_state.username, st.session_state.api_key, new_curr)
@@ -2111,12 +2269,7 @@ with st.sidebar:
             except Exception as e:
                 st.error(str(e))
 
-    if st.button(
-        "🔄 Sincronizar Tudo",
-        type="primary",
-        use_container_width=True,
-        help="Recarrega modelos, vendas, estatísticas e categorias diretamente do Cults3D.",
-    ):
+    if st.button("🔄 Sincronizar Tudo", type="primary", use_container_width=True):
         with st.spinner("A sincronizar..."):
             try:
                 sync_account(client, st.session_state.currency)
@@ -2125,11 +2278,7 @@ with st.sidebar:
             except Exception as e:
                 st.error(str(e))
 
-    if st.button(
-        "🚪 Trocar Conta / API Key",
-        use_container_width=True,
-        help="Termina a sessão atual e permite entrar com outra conta.",
-    ):
+    if st.button("🚪 Trocar Conta / API Key", use_container_width=True):
         bot.stop()
         st.session_state.connected = False
         st.session_state.api_key = ""
@@ -2139,24 +2288,31 @@ with st.sidebar:
 
 
 # ==============================================================================
-# PREPARAÇÃO DE DATAFRAMES & CLASSIFICAÇÃO BCG
+# PREPARAÇÃO DE DATAFRAMES & MÉTRICAS SEO
 # ==============================================================================
 def build_dataframes():
     creations_rows = []
     for c in st.session_state.creations:
         price_obj = c.get("price") or {}
         tags_raw = c.get("tags") or []
+        name_val = c.get("name") or ""
+        desc_val = c.get("description") or ""
+        price_val = round((price_obj.get("cents") or 0) / 100.0, 2)
+        seo_info = SeoOptimizerEngine.analyze_listing(name_val, desc_val, tags_raw, price_val)
+
         creations_rows.append({
             "id": str(c.get("id")),
-            "nome": c.get("name") or "",
-            "descricao": c.get("description") or "",
-            "preco": round((price_obj.get("cents") or 0) / 100.0, 2),
+            "nome": name_val,
+            "descricao": desc_val,
+            "preco": price_val,
             "views": int(c.get("viewsCount") or 0),
             "likes": int(c.get("likesCount") or 0),
             "downloads": int(c.get("downloadsCount") or 0),
             "publicado_em": c.get("publishedAt"),
             "tags_list": tags_raw,
             "tags": ", ".join(tags_raw),
+            "num_tags": len(tags_raw),
+            "seo_score": seo_info["score"],
             "url": c.get("url") or "",
         })
 
@@ -2179,11 +2335,11 @@ def build_dataframes():
 
 df_creations, df_sales = build_dataframes()
 
-tab_dash, tab_bot, tab_publish, tab_bulk, tab_market, tab_console = st.tabs([
+tab_dash, tab_publish, tab_bulk, tab_bot, tab_market, tab_console = st.tabs([
     "📊 Analytics & BI",
+    "🚀 Publicar (Drag & Drop)",
+    "⚡ Gestão & SEO em Massa",
     "🤖 Bot & Growth Engine",
-    "🚀 Estúdio Publicação & SEO",
-    "⚡ Gestão em Massa",
     "🔍 Radar N-Gram",
     "🛠️ Consola GraphQL",
 ])
@@ -2200,15 +2356,15 @@ with tab_dash:
         ticket_medio = (total_receita / total_vendas) if total_vendas > 0 else 0.0
         total_views = int(df_creations["views"].sum())
         conv_rate = (total_vendas / total_views * 100.0) if total_views > 0 else 0.0
-        rpm = (total_receita / total_views * 1000.0) if total_views > 0 else 0.0
+        avg_seo = int(round(df_creations["seo_score"].mean()))
 
         k1, k2, k3, k4, k5, k6 = st.columns(6)
-        k1.metric(f"Receita Líquida ({currency})", f"{total_receita:,.2f}", help="Valor líquido total ganho após comissões.")
-        k2.metric("Vendas Totais", f"{total_vendas}", help="Total de vendas concluídas.")
-        k3.metric(f"Ticket Médio ({currency})", f"{ticket_medio:,.2f}", help="Receita líquida média por venda.")
-        k4.metric("Visualizações", f"{total_views:,}", help="Views acumuladas de todo o catálogo.")
-        k5.metric("Conversão Global", f"{conv_rate:.2f}%", help="Percentagem de views que viram venda.")
-        k6.metric(f"RPM ({currency}/1k)", f"{rpm:,.2f}", help="Receita líquida por cada 1.000 visualizações.")
+        k1.metric(f"Receita Líquida ({currency})", f"{total_receita:,.2f}")
+        k2.metric("Vendas Totais", f"{total_vendas}")
+        k3.metric(f"Ticket Médio ({currency})", f"{ticket_medio:,.2f}")
+        k4.metric("Visualizações", f"{total_views:,}")
+        k5.metric("Conversão Global", f"{conv_rate:.2f}%")
+        k6.metric("SEO Médio Loja", f"{avg_seo}/100")
 
         if not df_sales.empty:
             sales_by_model = (
@@ -2273,17 +2429,19 @@ with tab_dash:
                     st.bar_chart(valid_sales.groupby("dia_sem")["sale_id"].count().reindex(dias_pt, fill_value=0))
 
         st.divider()
-        st.subheader("Matriz de Performance do Catálogo")
+        st.subheader("Matriz de Performance & SEO do Catálogo")
         filter_tier = st.multiselect("Filtrar por Diagnóstico", options=sorted(perf_df["estado_bcg"].unique().tolist()))
         view_df = perf_df[perf_df["estado_bcg"].isin(filter_tier)] if filter_tier else perf_df
 
         st.dataframe(
-            view_df[["nome", "estado_bcg", "preco", "views", "likes", "downloads", "vendas", "receita", "conversao_%", "url"]].sort_values(by=["receita", "views"], ascending=False),
+            view_df[["nome", "estado_bcg", "seo_score", "num_tags", "preco", "views", "likes", "vendas", "receita", "conversao_%", "url"]].sort_values(by=["receita", "views"], ascending=False),
             use_container_width=True,
             hide_index=True,
             column_config={
                 "nome": "Modelo",
                 "estado_bcg": "Diagnóstico",
+                "seo_score": st.column_config.ProgressColumn("SEO", min_value=0, max_value=100, format="%d/100"),
+                "num_tags": "Tags",
                 "url": st.column_config.LinkColumn("Página", display_text="Abrir"),
                 "preco": st.column_config.NumberColumn(f"Preço ({currency})", format="%.2f"),
                 "receita": st.column_config.NumberColumn(f"Receita ({currency})", format="%.2f"),
@@ -2291,45 +2449,561 @@ with tab_dash:
             },
         )
 
-        with st.expander("🔬 Inspetor & Editor Rápido Individual"):
+        with st.expander("🔬 Inspetor & Otimizador Individual (1 Clique)"):
             model_names_map = {row["nome"]: row for _, row in perf_df.iterrows()}
             chosen_name = st.selectbox("Escolhe um modelo", list(model_names_map.keys()))
             m_row = model_names_map[chosen_name]
-            seo_eval = analyze_listing_seo(m_row["nome"], m_row["descricao"], m_row["tags_list"], m_row["preco"])
+            seo_eval = SeoOptimizerEngine.analyze_listing(m_row["nome"], m_row["descricao"], m_row["tags_list"], m_row["preco"])
 
             ic1, ic2, ic3, ic4 = st.columns(4)
             ic1.metric("SEO Score", f"{seo_eval['score']}/100")
-            ic2.metric("Likes / Views", f"{m_row['likes_ratio_%']}%")
+            ic2.metric("Tags Atuais", f"{m_row['num_tags']}/20")
             ic3.metric("Diagnóstico", m_row["estado_bcg"].split(" (")[0])
             ic4.metric("Receita Gerada", f"{m_row['receita']:.2f} {currency}")
 
             if seo_eval["tips"]:
-                st.warning("💡 **Sugestões:** " + " | ".join(seo_eval["tips"]))
+                st.warning("💡 **Oportunidades SEO:** " + " | ".join(seo_eval["tips"]))
+
+            if st.button("✨ Auto-Preencher SEO & 20 Tags Otimizadas nos Campos Abaixo", key="btn_autofill_single"):
+                opt_n, opt_d, opt_t = SeoOptimizerEngine.auto_optimize_listing(
+                    m_row["nome"], m_row["descricao"], m_row["tags_list"]
+                )
+                st.session_state[f"qe_n_{m_row['id']}"] = opt_n
+                st.session_state[f"qe_d_{m_row['id']}"] = opt_d
+                st.session_state[f"qe_t_{m_row['id']}"] = ", ".join(opt_t)
+                st.rerun()
 
             with st.form("quick_edit_single_form"):
-                qe_name = st.text_input("Título", value=m_row["nome"])
+                qe_name = st.text_input("Título", value=st.session_state.get(f"qe_n_{m_row['id']}", m_row["nome"]))
                 qe_price = st.number_input(f"Preço ({currency})", min_value=0.0, step=0.5, value=float(m_row["preco"]))
-                qe_tags = st.text_input("Tags (vírgula)", value=m_row["tags"])
-                qe_desc = st.text_area("Descrição", value=m_row["descricao"], height=130)
-                if st.form_submit_button("💾 Guardar Alterações", type="primary"):
+                qe_tags = st.text_input("Tags (até 20, separadas por vírgula)", value=st.session_state.get(f"qe_t_{m_row['id']}", m_row["tags"]))
+                qe_desc = st.text_area("Descrição", value=st.session_state.get(f"qe_d_{m_row['id']}", m_row["descricao"]), height=140)
+                if st.form_submit_button("💾 Guardar Alterações no Cults3D", type="primary"):
                     try:
+                        final_tags = [t.strip() for t in qe_tags.split(",") if t.strip()][:20]
                         client.update_creation(
                             creation_id=m_row["id"],
                             name=qe_name.strip(),
                             description=qe_desc.strip(),
                             price=qe_price,
                             currency=currency,
-                            tags=[t.strip() for t in qe_tags.split(",") if t.strip()],
+                            tags=final_tags,
+                        )
+                        bot.record_action(
+                            "EDIÇÃO_INDIVIDUAL",
+                            m_row["id"],
+                            m_row["nome"],
+                            f"SEO & Preço ({qe_price:.2f} {currency})",
+                            before_state={"name": m_row["nome"], "description": m_row["descricao"], "price": m_row["preco"], "tags": m_row["tags_list"]},
+                            after_state={"name": qe_name.strip(), "description": qe_desc.strip(), "price": qe_price, "tags": final_tags},
+                            reversible=True,
                         )
                         st.session_state.creations = client.get_all_my_creations(currency=currency)
-                        st.success("Modelo atualizado!")
+                        st.success("Modelo atualizado e backup guardado no Rollback!")
                         st.rerun()
                     except Exception as e:
                         st.error(str(e))
 
 
 # ==============================================================================
-# ABA 2: BOT AUTÓNOMO & GROWTH ENGINE
+# ABA 2: ESTÚDIO DE PUBLICAÇÃO (DRAG & DROP DIRETO + SEO AUTOMÁTICO)
+# ==============================================================================
+with tab_publish:
+    st.subheader("🚀 Estúdio de Publicação — Arrastar & Largar Direto")
+
+    with bot._lock:
+        presets_dict = dict(bot.presets)
+
+    selected_preset_name = st.selectbox(
+        "Selecionar Gama / Template de Produto",
+        ["(Personalizado / Em branco)"] + list(presets_dict.keys()),
+        help="Preenche automaticamente parâmetros de impressão, FAQ anti-dúvidas, preço e tags.",
+    )
+    active_preset = presets_dict.get(selected_preset_name, {})
+
+    cats = st.session_state.categories
+    cat_map = {c["label"]: c["id"] for c in cats} if cats else {}
+
+    col_form, col_preview = st.columns([1.45, 1])
+
+    with col_form:
+        p_name = st.text_input("Título do Modelo *", placeholder="Ex: Seat Leon Mk2 (1P) - 52mm Air Vent Turbo Gauge Pod")
+
+        c1, c2, c3 = st.columns(3)
+        if cat_map:
+            default_cat_idx = 0
+            hint = str(active_preset.get("category_hint", "")).lower()
+            if hint:
+                for idx_c, lbl_c in enumerate(cat_map.keys()):
+                    if hint in lbl_c.lower():
+                        default_cat_idx = idx_c
+                        break
+            selected_cat_label = c1.selectbox("Categoria *", list(cat_map.keys()), index=default_cat_idx)
+            p_cat_id = cat_map[selected_cat_label]
+        else:
+            p_cat_id = c1.text_input("ID da Categoria *")
+
+        p_price = c2.number_input(f"Preço ({currency})", min_value=0.0, step=0.5, value=float(active_preset.get("price", 2.90)))
+        p_locale = c3.selectbox("Idioma", ["EN", "PT", "ES", "FR", "DE"], index=0)
+
+        st.markdown("#### 🖼️ Fotos & Renders do Modelo (Arrasta para aqui)")
+        uploaded_images = st.file_uploader(
+            "Arrasta as fotos/renders do modelo (a 1.ª imagem será a capa principal)",
+            type=["png", "jpg", "jpeg", "webp"],
+            accept_multiple_files=True,
+            key="pub_img_uploader",
+        )
+        if uploaded_images:
+            img_cols = st.columns(min(4, len(uploaded_images)))
+            for idx_img, up_img in enumerate(uploaded_images):
+                with img_cols[idx_img % 4]:
+                    st.image(up_img, caption=f"{'⭐ Capa' if idx_img == 0 else f'Foto {idx_img + 1}'}", use_container_width=True)
+
+        st.markdown("#### 📦 Ficheiros 3D para Impressão (Arrasta para aqui)")
+        uploaded_3d_files = st.file_uploader(
+            "Arrasta os ficheiros STL, 3MF, OBJ, STEP ou ZIP",
+            type=["stl", "3mf", "obj", "step", "stp", "zip"],
+            accept_multiple_files=True,
+            key="pub_3d_uploader",
+        )
+        if uploaded_3d_files:
+            for up_f in uploaded_3d_files:
+                size_kb = round(up_f.size / 1024.0, 1)
+                st.markdown(f"<div class='upload-badge'>📄 <b>{up_f.name}</b> ({size_kb} KB) — Pronto para envio automático</div>", unsafe_allow_html=True)
+
+        with st.expander("🔗 Opcional: Adicionar também links HTTPS externos manualmente"):
+            manual_files_txt = st.text_area("URLs Ficheiros 3D (1 por linha)", height=60)
+            manual_imgs_txt = st.text_area("URLs Imagens (1 por linha)", height=60)
+
+        st.markdown("#### 📝 Descrição Estruturada & Tags")
+        d_overview = st.text_area("1. Resumo & Funcionalidades *", value=active_preset.get("overview", ""), height=75)
+        d_settings = st.text_area("2. Definições de Impressão 3D *", value=active_preset.get("print_settings", ""), height=95)
+        d_assembly = st.text_area("3. Montagem & Hardware", value=active_preset.get("assembly", ""), height=55)
+        d_faq = st.text_area("4. FAQ Anti-Dúvidas (reduz abandono)", value=active_preset.get("faq", ""), height=60)
+        d_license = st.text_input("5. Aviso de Licença", value=active_preset.get("license", "Personal use only."))
+
+        auto_imperial_pub = st.checkbox("Converter medidas mm ➔ polegadas automaticamente (ex: 8mm ➔ 8mm (5/16\"))", value=True)
+        p_tags = st.text_input("Tags SEO (até 20, separadas por vírgula) *", value=active_preset.get("tags", ""))
+
+    # Construir descrição e tags otimizadas em tempo real
+    raw_sections = [d_overview.strip()]
+    if d_settings.strip():
+        raw_sections.append(f"### Print Settings\n{d_settings.strip()}")
+    if d_assembly.strip():
+        raw_sections.append(f"### Assembly & Hardware\n{d_assembly.strip()}")
+    if d_faq.strip():
+        raw_sections.append(f"### FAQ & Fitment Notes\n{d_faq.strip()}")
+    if d_license.strip():
+        raw_sections.append(f"### License\n{d_license.strip()}")
+    composed_desc = "\n\n".join(s for s in raw_sections if s)
+
+    final_pub_name = SeoOptimizerEngine.enrich_metric_units(p_name.strip()) if auto_imperial_pub else p_name.strip()
+    final_pub_desc = SeoOptimizerEngine.enrich_metric_units(composed_desc) if auto_imperial_pub else composed_desc
+    base_tag_list = [t.strip() for t in p_tags.split(",") if t.strip()]
+    enriched_pub_tags = SeoOptimizerEngine.build_20_tags(final_pub_name, final_pub_desc, base_tag_list, max_tags=20)
+    seo_report = SeoOptimizerEngine.analyze_listing(final_pub_name, final_pub_desc, enriched_pub_tags, p_price)
+
+    with col_preview:
+        st.markdown("#### 🎯 Diagnóstico SEO em Direto")
+        st.progress(seo_report["score"] / 100.0, text=f"Qualidade SEO: {seo_report['score']}/100 ({len(enriched_pub_tags)}/20 tags)")
+        st.caption("**Top 20 Tags Ordenadas por Peso que serão enviadas:**")
+        st.code(", ".join(enriched_pub_tags), language=None)
+        for tip in seo_report["tips"]:
+            st.caption(f"⚠️ {tip}")
+
+        st.markdown("#### 👁️ Pré-visualização Final")
+        st.markdown(f"<div class='seo-card'><b>{final_pub_name or 'Título do Modelo'}</b><br><br>{final_pub_desc.replace(chr(10), '<br>')}</div>", unsafe_allow_html=True)
+
+        with st.expander("💾 Guardar como Nova Gama"):
+            new_preset_title = st.text_input("Nome da Gama", placeholder="Ex: Peças Seat Leon Mk2")
+            if st.button("Guardar Preset", use_container_width=True):
+                if new_preset_title.strip():
+                    with bot._lock:
+                        bot.presets[new_preset_title.strip()] = {
+                            "category_hint": "",
+                            "price": float(p_price),
+                            "locale": p_locale,
+                            "tags": p_tags,
+                            "overview": d_overview,
+                            "print_settings": d_settings,
+                            "assembly": d_assembly,
+                            "faq": d_faq,
+                            "license": d_license,
+                        }
+                    bot._save_state()
+                    st.success("Preset guardado!")
+                    st.rerun()
+
+    st.divider()
+    golden_utc = next_golden_hour_utc()
+    golden_local_str = golden_utc.astimezone().strftime("%a %d/%m às %H:%M")
+
+    act_p1, act_p2, act_p3 = st.columns([1.1, 1.2, 1.2])
+    sched_mode = act_p2.selectbox(
+        "Modo de Agendamento",
+        [f"🌟 Hora de Ouro ({golden_local_str})", "⏱️ Daqui a 2 horas", "⏱️ Daqui a 6 horas", "⏱️ Daqui a 24 horas"],
+    )
+
+    def prepare_uploaded_urls() -> Tuple[List[str], List[str]]:
+        f_urls = [u.strip() for u in manual_files_txt.splitlines() if u.strip()]
+        i_urls = [u.strip() for u in manual_imgs_txt.splitlines() if u.strip()]
+
+        for up_img in (uploaded_images or []):
+            hosted_url = CloudAssetUploader.upload_bytes(up_img.getvalue(), up_img.name, up_img.type or "image/jpeg")
+            i_urls.append(hosted_url)
+
+        for up_f in (uploaded_3d_files or []):
+            hosted_url = CloudAssetUploader.upload_bytes(up_f.getvalue(), up_f.name, up_f.type or "application/octet-stream")
+            f_urls.append(hosted_url)
+
+        return f_urls, i_urls
+
+    if act_p1.button("🚀 Publicar Agora no Cults3D", type="primary", use_container_width=True):
+        if not final_pub_name or not final_pub_desc or not p_cat_id:
+            st.warning("Preenche o Título, Categoria e Descrição.")
+        elif not (uploaded_images or manual_imgs_txt.strip()) or not (uploaded_3d_files or manual_files_txt.strip()):
+            st.warning("Arrasta pelo menos 1 foto do modelo e 1 ficheiro 3D (STL/3MF/ZIP).")
+        else:
+            with st.spinner("A carregar fotos e ficheiros 3D para a cloud e a publicar no Cults3D..."):
+                try:
+                    file_list, img_list = prepare_uploaded_urls()
+                    created = client.create_creation(
+                        name=final_pub_name,
+                        description=final_pub_desc,
+                        category_id=str(p_cat_id),
+                        file_urls=file_list,
+                        image_urls=img_list,
+                        price=p_price,
+                        currency=currency,
+                        tags=enriched_pub_tags,
+                        locale=p_locale,
+                    )
+                    st.session_state.creations = client.get_all_my_creations(currency=currency)
+                    st.success(f"Modelo publicado com sucesso! Link: {created.get('url')}")
+                except Exception as e:
+                    st.error(str(e))
+
+    if act_p3.button("🗓️ Agendar na Fila do Bot", use_container_width=True):
+        if not final_pub_name or not final_pub_desc or not p_cat_id:
+            st.warning("Preenche o Título, Categoria e Descrição.")
+        elif not (uploaded_images or manual_imgs_txt.strip()) or not (uploaded_3d_files or manual_files_txt.strip()):
+            st.warning("Arrasta pelo menos 1 foto do modelo e 1 ficheiro 3D (STL/3MF/ZIP).")
+        else:
+            with st.spinner("A preparar ficheiros e a agendar na fila..."):
+                try:
+                    file_list, img_list = prepare_uploaded_urls()
+                    if "Hora de Ouro" in sched_mode:
+                        sched_dt = golden_utc
+                    elif "6 horas" in sched_mode:
+                        sched_dt = datetime.now(timezone.utc) + timedelta(hours=6)
+                    elif "24 horas" in sched_mode:
+                        sched_dt = datetime.now(timezone.utc) + timedelta(hours=24)
+                    else:
+                        sched_dt = datetime.now(timezone.utc) + timedelta(hours=2)
+
+                    with bot._lock:
+                        bot.publish_queue.append({
+                            "queue_id": f"q_{int(time.time() * 1000)}",
+                            "name": final_pub_name,
+                            "description": final_pub_desc,
+                            "category_id": str(p_cat_id),
+                            "price": float(p_price),
+                            "locale": p_locale,
+                            "tags": enriched_pub_tags,
+                            "file_urls": file_list,
+                            "image_urls": img_list,
+                            "scheduled_at": sched_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                            "status": "Pendente",
+                        })
+                    bot._save_state()
+                    st.success(f"Agendado para {sched_dt.strftime('%Y-%m-%d %H:%M UTC')}!")
+                except Exception as e:
+                    st.error(str(e))
+
+
+# ==============================================================================
+# ABA 3: ESTÚDIO DE GESTÃO & SEO EM MASSA (BOMBASTIC & REVERSÍVEL)
+# ==============================================================================
+with tab_bulk:
+    if df_creations.empty:
+        st.info("Não tens modelos carregados.")
+    else:
+        st.subheader("⚡ Estúdio de Edição & SEO em Massa (com Backup & Rollback)")
+
+        # Filtro inteligente de seleção
+        f_col1, f_col2 = st.columns([1.5, 2.5])
+        quick_filter = f_col1.selectbox(
+            "Seleção Rápida Inteligente",
+            [
+                "Seleção Manual",
+                "Todos os Modelos",
+                "SEO Fraco (< 75/100)",
+                "Poucas Tags (< 15 tags)",
+                "Muito Vistos / 0 Vendas",
+                "Preços Baixos (< 2.50)",
+            ],
+        )
+
+        options_map = {
+            f"{r['nome']} [SEO {r['seo_score']}/100 | {r['num_tags']} tags | {r['preco']:.2f} {currency}]": r
+            for _, r in df_creations.iterrows()
+        }
+        all_labels = list(options_map.keys())
+
+        default_selected: List[str] = []
+        if quick_filter == "Todos os Modelos":
+            default_selected = all_labels
+        elif quick_filter == "SEO Fraco (< 75/100)":
+            default_selected = [k for k, v in options_map.items() if v["seo_score"] < 75]
+        elif quick_filter == "Poucas Tags (< 15 tags)":
+            default_selected = [k for k, v in options_map.items() if v["num_tags"] < 15]
+        elif quick_filter == "Muito Vistos / 0 Vendas":
+            sales_ids = set(df_sales["creation_id"].unique()) if not df_sales.empty else set()
+            default_selected = [k for k, v in options_map.items() if v["views"] >= 50 and v["id"] not in sales_ids and v["preco"] > 0]
+        elif quick_filter == "Preços Baixos (< 2.50)":
+            default_selected = [k for k, v in options_map.items() if 0 < v["preco"] < 2.50]
+
+        selected_labels = f_col2.multiselect(
+            f"Modelos Alvo ({len(default_selected)} pré-selecionados)",
+            all_labels,
+            default=default_selected,
+        )
+
+        b_seo, b_text, b_tags, b_price = st.tabs([
+            "🧠 Auto-SEO em Massa (20 Tags + Medidas)",
+            "📝 Localizar/Substituir & Blocos",
+            "🏷️ Gestor Cirúrgico de Tags",
+            "💰 Preços Psicológicos & Promos",
+        ])
+
+        # --- SUB-TAB 1: AUTO-SEO EM MASSA ---
+        with b_seo:
+            st.markdown("Otimiza automaticamente títulos, medidas (mm ➔ polegadas), bloco técnico de impressão e preenche até às **20 tags ordenadas por relevância**.")
+            sc1, sc2, sc3 = st.columns(3)
+            opt_imperial = sc1.checkbox("Converter mm ➔ polegadas", value=True)
+            opt_print_blk = sc2.checkbox("Injetar Print Settings se faltar", value=True)
+            opt_priority_tags = sc3.text_input("Tags prioritárias a forçar no Top 5", placeholder="ex: fsdesigns, petg")
+
+            if selected_labels:
+                preview_rows = []
+                computed_updates: List[Dict[str, Any]] = []
+                extra_t_list = [t.strip() for t in opt_priority_tags.split(",") if t.strip()]
+
+                for lbl in selected_labels:
+                    row = options_map[lbl]
+                    new_n, new_d, new_t = SeoOptimizerEngine.auto_optimize_listing(
+                        row["nome"],
+                        row["descricao"],
+                        row["tags_list"],
+                        add_imperial=opt_imperial,
+                        ensure_print_block=opt_print_blk,
+                        extra_tags=extra_t_list,
+                    )
+                    new_eval = SeoOptimizerEngine.analyze_listing(new_n, new_d, new_t, row["preco"])
+                    preview_rows.append({
+                        "Modelo Atual": row["nome"],
+                        "SEO Antes": f"{row['seo_score']}/100",
+                        "SEO Depois": f"{new_eval['score']}/100",
+                        "Tags": f"{row['num_tags']} ➔ {len(new_t)}",
+                        "Top 5 Tags Novas": ", ".join(new_t[:5]),
+                    })
+                    computed_updates.append({
+                        "row": row,
+                        "new_name": new_n,
+                        "new_desc": new_d,
+                        "new_tags": new_t,
+                    })
+
+                st.dataframe(pd.DataFrame(preview_rows), use_container_width=True, hide_index=True)
+
+                if st.button(f"🚀 Aplicar Otimização SEO em {len(computed_updates)} Modelo(s)", type="primary", use_container_width=True):
+                    prog = st.progress(0.0)
+                    done_cnt = 0
+                    for idx_u, item_u in enumerate(computed_updates):
+                        r = item_u["row"]
+                        try:
+                            client.update_creation(
+                                creation_id=r["id"],
+                                name=item_u["new_name"],
+                                description=item_u["new_desc"],
+                                tags=item_u["new_tags"],
+                            )
+                            bot.record_action(
+                                "BULK_SEO",
+                                r["id"],
+                                r["nome"],
+                                f"Auto-SEO ({len(item_u['new_tags'])} tags)",
+                                before_state={"name": r["nome"], "description": r["descricao"], "tags": r["tags_list"]},
+                                after_state={"name": item_u["new_name"], "description": item_u["new_desc"], "tags": item_u["new_tags"]},
+                                reversible=True,
+                            )
+                            done_cnt += 1
+                        except Exception as exc:
+                            st.error(f"Erro em '{r['nome']}': {exc}")
+                        prog.progress((idx_u + 1) / len(computed_updates))
+
+                    st.session_state.creations = client.get_all_my_creations(currency=currency)
+                    st.success(f"SEO otimizado com sucesso em {done_cnt} modelo(s)! Backup guardado no Rollback.")
+                    st.rerun()
+
+        # --- SUB-TAB 2: LOCALIZAR/SUBSTITUIR & INJETOR DE BLOCOS ---
+        with b_text:
+            tx_c1, tx_c2 = st.columns(2)
+            with tx_c1:
+                st.markdown("#### 🔎 Localizar & Substituir")
+                fr_target = st.radio("Onde aplicar", ["Descrição", "Título"], horizontal=True)
+                fr_find = st.text_input("Texto a procurar", placeholder="ex: PLA only")
+                fr_replace = st.text_input("Substituir por", placeholder="ex: PETG / ASA / ABS recommended")
+                if st.button("🔄 Executar Substituição", type="primary", use_container_width=True) and selected_labels and fr_find:
+                    updated_c = 0
+                    for lbl in selected_labels:
+                        r = options_map[lbl]
+                        if fr_target == "Descrição" and fr_find in r["descricao"]:
+                            nd = r["descricao"].replace(fr_find, fr_replace)
+                            client.update_creation(creation_id=r["id"], description=nd)
+                            bot.record_action("BULK_REPLACE", r["id"], r["nome"], f"'{fr_find}' -> '{fr_replace}'", before_state={"description": r["descricao"]}, after_state={"description": nd}, reversible=True)
+                            updated_c += 1
+                        elif fr_target == "Título" and fr_find in r["nome"]:
+                            nn = r["nome"].replace(fr_find, fr_replace)
+                            client.update_creation(creation_id=r["id"], name=nn)
+                            bot.record_action("BULK_REPLACE", r["id"], r["nome"], f"Título: '{fr_find}' -> '{fr_replace}'", before_state={"name": r["nome"]}, after_state={"name": nn}, reversible=True)
+                            updated_c += 1
+                    st.session_state.creations = client.get_all_my_creations(currency=currency)
+                    st.success(f"Substituição aplicada em {updated_c} modelo(s)!")
+                    st.rerun()
+
+            with tx_c2:
+                st.markdown("#### 🧩 Injetar / Atualizar Bloco de Conversão")
+                blk_preset = st.selectbox(
+                    "Template rápido de bloco",
+                    [
+                        "Banner Pack Completo (Upsell)",
+                        "Garantia & Tolerâncias (Anti-Dúvidas)",
+                        "Pedido de Make / Avaliação",
+                        "Personalizado",
+                    ],
+                )
+                default_blk = {
+                    "Banner Pack Completo (Upsell)": "🔥 WANT THE FULL BUNDLE? Check my profile for the Complete Pack and save over 30%!",
+                    "Garantia & Tolerâncias (Anti-Dúvidas)": "✅ FITMENT GUARANTEE: Engineered with 0.2mm clearance tolerances for accurate FDM printing. Message me anytime if you need custom dimensions!",
+                    "Pedido de Make / Avaliação": "📸 PRINTED THIS MODEL? Upload a Make photo on Cults3D — I love seeing your builds in action!",
+                    "Personalizado": "",
+                }[blk_preset]
+                blk_pos = st.radio("Posição na descrição", ["No Topo (máxima visibilidade)", "No Rodapé"], horizontal=True)
+                blk_text = st.text_area("Conteúdo do bloco", value=default_blk, height=90)
+
+                if st.button("➕ Aplicar Bloco nos Selecionados", type="primary", use_container_width=True) and selected_labels and blk_text.strip():
+                    marker_start = "=== STUDIO BLOCK ==="
+                    marker_end = "=== END STUDIO BLOCK ==="
+                    wrapped_block = f"{marker_start}\n{blk_text.strip()}\n{marker_end}"
+                    cnt_blk = 0
+                    for lbl in selected_labels:
+                        r = options_map[lbl]
+                        clean_d = re.sub(r"\n*=== STUDIO BLOCK ===.*?=== END STUDIO BLOCK ===\n*", "\n\n", r["descricao"], flags=re.DOTALL).strip()
+                        new_d = f"{wrapped_block}\n\n{clean_d}".strip() if "Topo" in blk_pos else f"{clean_d}\n\n{wrapped_block}".strip()
+                        if new_d != r["descricao"].strip():
+                            client.update_creation(creation_id=r["id"], description=new_d)
+                            bot.record_action("BULK_BLOCK", r["id"], r["nome"], "Bloco atualizado", before_state={"description": r["descricao"]}, after_state={"description": new_d}, reversible=True)
+                            cnt_blk += 1
+                    st.session_state.creations = client.get_all_my_creations(currency=currency)
+                    st.success(f"Bloco aplicado em {cnt_blk} modelo(s)!")
+                    st.rerun()
+
+        # --- SUB-TAB 3: GESTOR CIRÚRGICO DE TAGS ---
+        with b_tags:
+            tag_action = st.radio(
+                "Operação de Tags",
+                [
+                    "Promover para Top 5 (maior peso no algoritmo) + Adicionar",
+                    "Adicionar ao fim das existentes (até 20)",
+                    "Remover tags específicas",
+                    "Substituir todas as tags",
+                ],
+            )
+            tags_field = st.text_input("Tags (separadas por vírgula)", placeholder="ex: seat leon, 1p, gauge pod, 52mm")
+            if st.button("🏷️ Aplicar Alteração de Tags", type="primary", use_container_width=True) and selected_labels and tags_field.strip():
+                in_tags = [t.strip().lower() for t in tags_field.split(",") if t.strip()]
+                t_cnt = 0
+                for lbl in selected_labels:
+                    r = options_map[lbl]
+                    cur_t = [t.strip().lower() for t in r["tags_list"] if t.strip()]
+                    if "Promover" in tag_action:
+                        merged = list(dict.fromkeys(in_tags + cur_t))[:20]
+                    elif "Adicionar" in tag_action:
+                        merged = list(dict.fromkeys(cur_t + in_tags))[:20]
+                    elif "Remover" in tag_action:
+                        rem_set = set(in_tags)
+                        merged = [t for t in cur_t if t not in rem_set]
+                    else:
+                        merged = list(dict.fromkeys(in_tags))[:20]
+
+                    if merged != cur_t:
+                        client.update_creation(creation_id=r["id"], tags=merged)
+                        bot.record_action("BULK_TAGS", r["id"], r["nome"], f"{len(cur_t)} -> {len(merged)} tags", before_state={"tags": r["tags_list"]}, after_state={"tags": merged}, reversible=True)
+                        t_cnt += 1
+                st.session_state.creations = client.get_all_my_creations(currency=currency)
+                st.success(f"Tags atualizadas em {t_cnt} modelo(s)!")
+                st.rerun()
+
+        # --- SUB-TAB 4: PREÇOS PSICOLÓGICOS & PROMOÇÕES ---
+        with b_price:
+            pc1, pc2 = st.columns(2)
+            with pc1:
+                st.markdown("#### 💶 Preços & Arredondamento Psicológico")
+                p_strategy = st.selectbox(
+                    "Estratégia",
+                    [
+                        "Arredondar para .90 (ex: 2.30 -> 2.90)",
+                        "Arredondar para .99 (ex: 2.30 -> 2.99)",
+                        "Definir Piso Mínimo (proteger margem contra taxas)",
+                        "Ajuste Percentual (%)",
+                        "Preço Fixo Novo",
+                    ],
+                )
+                p_param = st.number_input("Valor / Piso / Percentagem", value=2.90, step=0.5)
+                if st.button("💾 Atualizar Preços Selecionados", type="primary", use_container_width=True) and selected_labels:
+                    p_cnt = 0
+                    for lbl in selected_labels:
+                        r = options_map[lbl]
+                        old_p = float(r["preco"])
+                        if old_p == 0 and "Fixo" not in p_strategy:
+                            continue
+                        if ".90" in p_strategy:
+                            new_p = round(int(old_p) + 0.90, 2)
+                        elif ".99" in p_strategy:
+                            new_p = round(int(old_p) + 0.99, 2)
+                        elif "Piso" in p_strategy:
+                            new_p = max(old_p, round(p_param, 2))
+                        elif "Percentual" in p_strategy:
+                            new_p = round(old_p * (1.0 + p_param / 100.0), 2)
+                        else:
+                            new_p = round(max(0.0, p_param), 2)
+
+                        if abs(new_p - old_p) > 0.009:
+                            client.update_creation(creation_id=r["id"], price=new_p, currency=currency)
+                            bot.record_action("BULK_PRICE", r["id"], r["nome"], f"{old_p:.2f} -> {new_p:.2f} {currency}", before_state={"price": old_p}, after_state={"price": new_p}, reversible=True)
+                            p_cnt += 1
+                    st.session_state.creations = client.get_all_my_creations(currency=currency)
+                    st.success(f"Preços atualizados em {p_cnt} modelo(s)!")
+                    st.rerun()
+
+            with pc2:
+                st.markdown("#### 🔥 Campanha de Desconto em Massa")
+                disc_pct = st.slider("Desconto (%)", 5, 90, 20, 5)
+                disc_days = st.number_input("Duração (dias)", 1, 90, 5)
+                if st.button("🔥 Ativar Desconto nos Selecionados", type="primary", use_container_width=True) and selected_labels:
+                    end_at = (datetime.now(timezone.utc) + timedelta(days=int(disc_days))).strftime("%Y-%m-%dT%H:%M:%SZ")
+                    d_cnt = 0
+                    for lbl in selected_labels:
+                        r = options_map[lbl]
+                        if r["preco"] > 0:
+                            client.create_discount(creation_id=r["id"], percentage=disc_pct, end_at_iso=end_at)
+                            d_cnt += 1
+                    st.success(f"Desconto de {disc_pct}% ativado em {d_cnt} modelo(s)!")
+
+
+# ==============================================================================
+# ABA 4: BOT AUTÓNOMO & GROWTH ENGINE
 # ==============================================================================
 with tab_bot:
     st.subheader("🤖 Bot Autónomo Cults3D (Anti-Sleep + Growth Engine)")
@@ -2337,7 +3011,7 @@ with tab_bot:
     b1, b2, b3, b4, b5 = st.columns([1, 1, 1.2, 1, 1.3])
     b1.metric("Estado", "🟢 ATIVO" if bot.running else "🔴 PARADO")
     b2.metric("Modo", "🧪 Simulação" if bot.config["dry_run"] else "⚡ Real")
-    b3.metric("Anti-Sleep", bot.keepalive_status, help="Faz ping automático a cada 4 minutos ao link da app para impedir hibernação.")
+    b3.metric("Anti-Sleep", bot.keepalive_status)
     b4.metric("Último Ciclo", (bot.last_run or "Nunca").split(" ")[-1])
 
     with b5:
@@ -2364,28 +3038,18 @@ with tab_bot:
         "📜 Logs",
     ])
 
-    # --- SUB-ABA 1: REGRAS GERAIS & ANTI-SLEEP ---
     with sub_rules:
         cfg = bot.config
         with st.form("full_bot_config_form"):
             st.markdown("#### 🛡️ Anti-Sleep Cloud, Motor & Notificações")
             as_c1, as_c2 = st.columns([2.2, 1])
-            in_app_url = as_c1.text_input(
-                "URL Público da App (para Anti-Sleep automático)",
-                value=cfg["app_url"],
-                placeholder="https://o-teu-app.streamlit.app",
-                help="Cola aqui o link da tua app no Streamlit Cloud (ou define APP_URL nos Secrets). O bot envia um ping a cada 4 min para nunca adormecer.",
-            )
-            in_as_on = as_c2.checkbox(
-                "Ativar Auto-Ping Anti-Sleep",
-                value=bool(cfg["anti_sleep_enabled"]),
-                help="Mantém o servidor acordado 24/7.",
-            )
+            in_app_url = as_c1.text_input("URL Público da App (Anti-Sleep)", value=cfg["app_url"])
+            in_as_on = as_c2.checkbox("Ativar Auto-Ping Anti-Sleep", value=bool(cfg["anti_sleep_enabled"]))
 
             m_c1, m_c2, m_c3 = st.columns(3)
-            in_interval = m_c1.number_input("Intervalo entre ciclos (min)", min_value=2, max_value=1440, value=int(cfg["interval_minutes"]))
-            in_max_act = m_c2.number_input("Máx. alterações por ciclo", min_value=1, max_value=20, value=int(cfg["max_actions_per_cycle"]))
-            in_dry = m_c3.checkbox("Modo Simulação (Dry-Run)", value=bool(cfg["dry_run"]), help="Testa regras nos logs sem alterar a loja.")
+            in_interval = m_c1.number_input("Intervalo (min)", min_value=2, max_value=1440, value=int(cfg["interval_minutes"]))
+            in_max_act = m_c2.number_input("Máx. alterações/ciclo", min_value=1, max_value=20, value=int(cfg["max_actions_per_cycle"]))
+            in_dry = m_c3.checkbox("Modo Simulação (Dry-Run)", value=bool(cfg["dry_run"]))
 
             n_c1, n_c2, n_c3 = st.columns(3)
             in_tg_tok = n_c1.text_input("Telegram Bot Token", value=cfg["tg_token"], type="password")
@@ -2396,29 +3060,25 @@ with tab_bot:
             st.markdown("#### 1️⃣ Vendas, Kit Social & Assistente Pós-Venda")
             s_c1, s_c2, s_c3, s_c4 = st.columns(4)
             in_r_sales = s_c1.checkbox("Alertar Vendas", value=bool(cfg["rule_sales_alert"]))
-            in_r_postsale = s_c2.checkbox("Script Pós-Venda", value=bool(cfg["rule_post_sale_script"]), help="Inclui mensagem pronta para pedir Make ao comprador.")
-            in_r_social = s_c3.checkbox("Kit Social (Reddit/IG)", value=bool(cfg["rule_social_kit"]), help="Envia post pronto a colar ao publicar ou lançar promo.")
+            in_r_postsale = s_c2.checkbox("Script Pós-Venda", value=bool(cfg["rule_post_sale_script"]))
+            in_r_social = s_c3.checkbox("Kit Social (Reddit/IG)", value=bool(cfg["rule_social_kit"]))
             in_r_mile = s_c4.checkbox("Celebrar Marcos", value=bool(cfg["rule_milestone_alert"]))
 
             st.divider()
-            st.markdown("#### 2️⃣ Vitrine Dinâmica de Cross-Selling & SEO")
+            st.markdown("#### 2️⃣ Vitrine Dinâmica & SEO Automático")
             v_c1, v_c2, v_c3 = st.columns([1.3, 0.8, 1.9])
-            in_r_show = v_c1.checkbox(
-                "Ativar Vitrine Dinâmica",
-                value=bool(cfg["rule_dynamic_showcase"]),
-                help="Injeta automaticamente os links dos teus Top Modelos na descrição dos restantes anúncios.",
-            )
+            in_r_show = v_c1.checkbox("Vitrine Dinâmica", value=bool(cfg["rule_dynamic_showcase"]))
             in_show_n = v_c2.number_input("Nº Top Modelos", min_value=1, max_value=5, value=int(cfg["showcase_top_n"]))
             in_show_title = v_c3.text_input("Título da Vitrine", value=cfg["showcase_title"])
 
-            in_r_seo = st.checkbox("Ativar Otimizador SEO & Rodapé Fixo", value=bool(cfg["rule_seo_optimizer"]))
+            in_r_seo = st.checkbox("Auto-SEO & 20 Tags nos Novos Modelos", value=bool(cfg["rule_seo_optimizer"]))
             seo_c1, seo_c2 = st.columns(2)
-            in_seo_marker = seo_c1.text_input("Marcador único rodapé", value=cfg["seo_footer_marker"])
-            in_seo_tags = seo_c2.text_input("Tags obrigatórias (vírgula)", value=cfg["seo_required_tags"])
-            in_seo_footer = st.text_area("Texto de rodapé", value=cfg["seo_footer_text"], height=70)
+            in_seo_marker = seo_c1.text_input("Marcador rodapé", value=cfg["seo_footer_marker"])
+            in_seo_tags = seo_c2.text_input("Tags prioritárias", value=cfg["seo_required_tags"])
+            in_seo_footer = st.text_area("Texto rodapé", value=cfg["seo_footer_text"], height=65)
 
             st.divider()
-            st.markdown("#### 3️⃣ Promoções Automáticas & Preço Dinâmico")
+            st.markdown("#### 3️⃣ Promoções & Preço Dinâmico")
             p_c1, p_c2, p_c3, p_c4, p_c5 = st.columns([1.2, 1, 1, 1, 1])
             in_r_promo = p_c1.checkbox("Auto-Promo (0 Vendas)", value=bool(cfg["rule_auto_promo"]))
             in_p_views = p_c2.number_input("Mín. Views", min_value=10, max_value=50000, value=int(cfg["promo_min_views"]))
@@ -2446,12 +3106,12 @@ with tab_bot:
             in_wk_pct = w_c4.number_input("Desconto Flash (%)", min_value=5, max_value=80, value=int(cfg["weekend_discount_pct"]))
 
             st.divider()
-            st.markdown("#### 4️⃣ Picos de Tráfego, Radar & Relatórios")
+            st.markdown("#### 4️⃣ Picos, Radar & Relatórios")
             sp_c1, sp_c2, rk_c1, rk_c2 = st.columns([1, 0.8, 1, 1.8])
             in_r_spike = sp_c1.checkbox("Picos Views", value=bool(cfg["rule_spike_alert"]))
             in_spike_val = sp_c2.number_input("Salto mín.", min_value=5, max_value=5000, value=int(cfg["spike_views_threshold"]))
             in_r_mkt = rk_c1.checkbox("Radar Nichos", value=bool(cfg["rule_market_watch"]))
-            in_kw = rk_c2.text_input("Keywords vigiadas (máx 4)", value=cfg["watch_keywords"], placeholder="seat leon, gauge pod")
+            in_kw = rk_c2.text_input("Keywords vigiadas (máx 4)", value=cfg["watch_keywords"])
 
             rep_c1, rep_c2, rep_c3, rep_c4 = st.columns(4)
             in_r_rep = rep_c1.checkbox("Relatório Diário", value=bool(cfg["rule_daily_report"]))
@@ -2515,7 +3175,7 @@ with tab_bot:
 
         c_t1, c_t2, c_t3 = st.columns(3)
         if c_t1.button("🔔 Testar Telegram/Discord", use_container_width=True):
-            bot.send_notification("✅ <b>Cults3D Studio Pro v4:</b> Notificações operacionais!")
+            bot.send_notification("✅ <b>Cults3D Studio Pro v5:</b> Notificações operacionais!")
             st.toast("Notificação enviada!")
         if c_t2.button("🛡️ Testar Ping Anti-Sleep", use_container_width=True):
             bot.ping_keep_alive()
@@ -2527,18 +3187,15 @@ with tab_bot:
             bot._save_state()
             st.toast("Cooldowns limpos!")
 
-    # --- SUB-ABA 2: EARLY-BIRD & TESTES A/B POR RPM ---
     with sub_growth:
         if df_creations.empty:
-            st.info("Carrega primeiro os teus modelos para configurar campanhas Early-Bird ou Testes A/B.")
+            st.info("Carrega primeiro os teus modelos.")
         else:
             model_options = {f"{r['nome']} (atual: {r['preco']:.2f} {currency})": r for _, r in df_creations.iterrows()}
             g_col1, g_col2 = st.columns(2)
 
-            # Coluna 1: Early-Bird
             with g_col1:
                 st.markdown("#### 🐣 Preço Early-Bird de Lançamento")
-                st.caption("Define um preço baixo para as primeiras X vendas ganharem tração no algoritmo; sobe automaticamente depois.")
                 with st.form("eb_form"):
                     eb_model_lbl = st.selectbox("Modelo alvo", list(model_options.keys()), key="eb_sel")
                     eb_launch = st.number_input(f"Preço Lançamento ({currency})", min_value=0.5, step=0.5, value=1.99)
@@ -2561,23 +3218,15 @@ with tab_bot:
                 if bot.early_bird_rules:
                     st.dataframe(
                         pd.DataFrame([
-                            {
-                                "Modelo": v["name"],
-                                "Lançamento": v["launch_price"],
-                                "Final": v["regular_price"],
-                                "Meta Vendas": v["target_sales"],
-                                "Estado": "Concluído" if v.get("completed") else "Ativo",
-                            }
+                            {"Modelo": v["name"], "Lançamento": v["launch_price"], "Final": v["regular_price"], "Meta": v["target_sales"], "Estado": "Concluído" if v.get("completed") else "Ativo"}
                             for v in bot.early_bird_rules.values()
                         ]),
                         use_container_width=True,
                         hide_index=True,
                     )
 
-            # Coluna 2: Teste A/B por RPM
             with g_col2:
                 st.markdown("#### 🧪 Teste A/B de Preço por RPM")
-                st.caption("Testa Preço A vs Preço B durante X dias cada e aplica automaticamente o que gerar maior lucro por 1.000 views.")
                 with st.form("ab_form"):
                     ab_model_lbl = st.selectbox("Modelo a testar", list(model_options.keys()), key="ab_sel")
                     ab_pa = st.number_input(f"Preço A ({currency})", min_value=0.5, step=0.5, value=2.50)
@@ -2607,30 +3256,20 @@ with tab_bot:
                 if bot.ab_tests:
                     st.dataframe(
                         pd.DataFrame([
-                            {
-                                "Modelo": v["name"],
-                                "Fase": v["phase"],
-                                "Preço A": v["price_a"],
-                                "Preço B": v["price_b"],
-                                "RPM A": v.get("rpm_a", 0),
-                                "RPM B": v.get("rpm_b", 0),
-                                "Vencedor": v.get("winner_price") or "-",
-                            }
+                            {"Modelo": v["name"], "Fase": v["phase"], "Preço A": v["price_a"], "Preço B": v["price_b"], "RPM A": v.get("rpm_a", 0), "RPM B": v.get("rpm_b", 0), "Vencedor": v.get("winner_price") or "-"}
                             for v in bot.ab_tests.values()
                         ]),
                         use_container_width=True,
                         hide_index=True,
                     )
 
-    # --- SUB-ABA 3: COMANDOS REMOTOS TELEGRAM ---
     with sub_tg:
-        st.markdown("#### 📱 Comandos Remotos via Telegram")
         st.markdown(
             """
             - `/status` — Estado do bot, Anti-Sleep, último ciclo e quota da API.
             - `/vendas` — Últimas 5 vendas com receita líquida e comprador.
             - `/top` — Top 5 modelos mais vistos e downloads.
-            - `/kit` — Gera um post pronto a copiar/colar para o teu modelo mais visto.
+            - `/kit` — Post pronto a copiar/colar para o teu modelo mais visto.
             - `/ciclo` — Força um ciclo completo imediato.
             - `/pausar` e `/retomar` — Pausa ou volta a ligar o bot pelo telemóvel.
             """
@@ -2639,9 +3278,7 @@ with tab_bot:
             bot.poll_telegram_commands()
             st.toast("Comandos verificados!")
 
-    # --- SUB-ABA 4: FILA DE PUBLICAÇÃO ---
     with sub_queue:
-        st.markdown("#### 🗓️ Fila de Publicação Agendada")
         if bot.publish_queue:
             st.dataframe(
                 pd.DataFrame([
@@ -2657,11 +3294,9 @@ with tab_bot:
                 bot._save_state()
                 st.rerun()
         else:
-            st.info("Fila vazia. Agenda modelos na aba **🚀 Estúdio Publicação & SEO**.")
+            st.info("Fila vazia.")
 
-    # --- SUB-ABA 5: ROLLBACK ---
     with sub_rollback:
-        st.markdown("#### ↩️ Histórico & Desfazer Alterações")
         with bot._lock:
             hist_items = list(bot.action_history)
         if not hist_items:
@@ -2686,7 +3321,6 @@ with tab_bot:
                     except Exception as e:
                         st.error(str(e))
 
-    # --- SUB-ABA 6: LOGS ---
     with sub_logs:
         l1, l2 = st.columns(2)
         if l1.button("🔄 Atualizar Logs", use_container_width=True):
@@ -2705,233 +3339,12 @@ with tab_bot:
 
 
 # ==============================================================================
-# ABA 3: ESTÚDIO DE PUBLICAÇÃO & SEO (PRESETS, FAQ ANTI-DÚVIDAS & HORA DE OURO)
-# ==============================================================================
-with tab_publish:
-    st.subheader("🚀 Estúdio Profissional de Publicação & SEO")
-
-    with bot._lock:
-        presets_dict = dict(bot.presets)
-
-    selected_preset_name = st.selectbox(
-        "Selecionar Gama / Template de Produto",
-        ["(Personalizado / Em branco)"] + list(presets_dict.keys()),
-        help="Preenche automaticamente parâmetros de impressão, FAQ anti-dúvidas, preço e tags.",
-    )
-    active_preset = presets_dict.get(selected_preset_name, {})
-
-    cats = st.session_state.categories
-    cat_map = {c["label"]: c["id"] for c in cats} if cats else {}
-
-    col_form, col_preview = st.columns([1.4, 1])
-
-    with col_form:
-        p_name = st.text_input("Título do Modelo *", placeholder="Ex: Seat Leon Mk2 (1P) - 52mm Air Vent Turbo Gauge Pod")
-
-        c1, c2, c3 = st.columns(3)
-        if cat_map:
-            default_cat_idx = 0
-            hint = str(active_preset.get("category_hint", "")).lower()
-            if hint:
-                for idx_c, lbl_c in enumerate(cat_map.keys()):
-                    if hint in lbl_c.lower():
-                        default_cat_idx = idx_c
-                        break
-            selected_cat_label = c1.selectbox("Categoria *", list(cat_map.keys()), index=default_cat_idx)
-            p_cat_id = cat_map[selected_cat_label]
-        else:
-            p_cat_id = c1.text_input("ID da Categoria *")
-
-        p_price = c2.number_input(f"Preço ({currency})", min_value=0.0, step=0.5, value=float(active_preset.get("price", 2.50)))
-        p_locale = c3.selectbox("Idioma", ["EN", "PT", "ES", "FR", "DE"], index=0)
-
-        d_overview = st.text_area("1. Resumo & Funcionalidades *", value=active_preset.get("overview", ""), height=75)
-        d_settings = st.text_area("2. Definições de Impressão 3D *", value=active_preset.get("print_settings", ""), height=100)
-        d_assembly = st.text_area("3. Montagem & Hardware", value=active_preset.get("assembly", ""), height=60)
-        d_faq = st.text_area("4. FAQ Anti-Dúvidas (aumenta conversão)", value=active_preset.get("faq", ""), height=65)
-        d_license = st.text_input("5. Aviso de Licença", value=active_preset.get("license", "Personal use only."))
-
-        p_tags = st.text_input("Tags SEO (vírgula) *", value=active_preset.get("tags", ""))
-        p_files = st.text_area("URLs Ficheiros 3D (HTTPS, 1 por linha) *", placeholder="https://.../peca.stl", height=70)
-        p_images = st.text_area("URLs Imagens / Renders (HTTPS, 1 por linha) *", placeholder="https://.../render1.jpg", height=70)
-
-    sections = [d_overview.strip()]
-    if d_settings.strip():
-        sections.append(f"### Print Settings\n{d_settings.strip()}")
-    if d_assembly.strip():
-        sections.append(f"### Assembly & Hardware\n{d_assembly.strip()}")
-    if d_faq.strip():
-        sections.append(f"### FAQ & Fitment Notes\n{d_faq.strip()}")
-    if d_license.strip():
-        sections.append(f"### License\n{d_license.strip()}")
-    full_description = "\n\n".join(s for s in sections if s)
-
-    tag_list = [t.strip() for t in p_tags.split(",") if t.strip()]
-    seo_report = analyze_listing_seo(p_name, full_description, tag_list, p_price)
-
-    with col_preview:
-        st.markdown("#### 🎯 Diagnóstico SEO")
-        st.progress(seo_report["score"] / 100.0, text=f"Qualidade SEO: {seo_report['score']}/100")
-        if seo_report["suggested_tags"]:
-            st.info("**Tags extraídas do título:** `" + ", ".join(seo_report["suggested_tags"]) + "`")
-        for tip in seo_report["tips"]:
-            st.caption(f"⚠️ {tip}")
-
-        st.markdown("#### 👁️ Pré-visualização")
-        st.markdown(f"<div class='seo-card'>{full_description.replace(chr(10), '<br>')}</div>", unsafe_allow_html=True)
-
-        with st.expander("💾 Guardar como Nova Gama"):
-            new_preset_title = st.text_input("Nome da Gama", placeholder="Ex: Peças Seat Leon Mk2")
-            if st.button("Guardar Preset", use_container_width=True):
-                if new_preset_title.strip():
-                    with bot._lock:
-                        bot.presets[new_preset_title.strip()] = {
-                            "category_hint": "",
-                            "price": float(p_price),
-                            "locale": p_locale,
-                            "tags": p_tags,
-                            "overview": d_overview,
-                            "print_settings": d_settings,
-                            "assembly": d_assembly,
-                            "faq": d_faq,
-                            "license": d_license,
-                        }
-                    bot._save_state()
-                    st.success("Preset guardado!")
-                    st.rerun()
-
-    st.divider()
-    golden_utc = next_golden_hour_utc()
-    golden_local_str = golden_utc.astimezone().strftime("%a %d/%m às %H:%M")
-
-    act_p1, act_p2, act_p3 = st.columns([1.1, 1.2, 1.2])
-    sched_mode = act_p2.selectbox(
-        "Modo de Agendamento",
-        [f"🌟 Hora de Ouro ({golden_local_str})", "⏱️ Daqui a 2 horas", "⏱️ Daqui a 6 horas", "⏱️ Daqui a 24 horas"],
-        help="Hora de Ouro agenda automaticamente para o próximo pico de tráfego (Sexta 18h ou Domingo 15h).",
-    )
-
-    file_list = [u.strip() for u in p_files.splitlines() if u.strip()]
-    img_list = [u.strip() for u in p_images.splitlines() if u.strip()]
-
-    if act_p1.button("🚀 Publicar Agora", type="primary", use_container_width=True):
-        if not p_name.strip() or not full_description.strip() or not p_cat_id or not file_list or not img_list:
-            st.warning("Preenche todos os campos obrigatórios (*).")
-        elif not all(u.startswith("https://") for u in file_list + img_list):
-            st.warning("Todos os URLs têm de começar por https://")
-        else:
-            with st.spinner("A publicar no Cults3D..."):
-                try:
-                    created = client.create_creation(
-                        name=p_name.strip(),
-                        description=full_description,
-                        category_id=str(p_cat_id),
-                        file_urls=file_list,
-                        image_urls=img_list,
-                        price=p_price,
-                        currency=currency,
-                        tags=tag_list,
-                        locale=p_locale,
-                    )
-                    st.session_state.creations = client.get_all_my_creations(currency=currency)
-                    st.success(f"Publicado! Link: {created.get('url')}")
-                except Exception as e:
-                    st.error(str(e))
-
-    if act_p3.button("🗓️ Agendar na Fila do Bot", use_container_width=True):
-        if not p_name.strip() or not full_description.strip() or not p_cat_id or not file_list or not img_list:
-            st.warning("Preenche todos os campos obrigatórios (*).")
-        elif not all(u.startswith("https://") for u in file_list + img_list):
-            st.warning("Todos os URLs têm de começar por https://")
-        else:
-            if "Hora de Ouro" in sched_mode:
-                sched_dt = golden_utc
-            elif "6 horas" in sched_mode:
-                sched_dt = datetime.now(timezone.utc) + timedelta(hours=6)
-            elif "24 horas" in sched_mode:
-                sched_dt = datetime.now(timezone.utc) + timedelta(hours=24)
-            else:
-                sched_dt = datetime.now(timezone.utc) + timedelta(hours=2)
-
-            with bot._lock:
-                bot.publish_queue.append({
-                    "queue_id": f"q_{int(time.time() * 1000)}",
-                    "name": p_name.strip(),
-                    "description": full_description,
-                    "category_id": str(p_cat_id),
-                    "price": float(p_price),
-                    "locale": p_locale,
-                    "tags": tag_list,
-                    "file_urls": file_list,
-                    "image_urls": img_list,
-                    "scheduled_at": sched_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                    "status": "Pendente",
-                })
-            bot._save_state()
-            st.success(f"Agendado para {sched_dt.strftime('%Y-%m-%d %H:%M UTC')}!")
-
-
-# ==============================================================================
-# ABA 4: GESTÃO EM MASSA
-# ==============================================================================
-with tab_bulk:
-    if df_creations.empty:
-        st.info("Não tens modelos carregados.")
-    else:
-        st.subheader("⚡ Edição em Massa")
-        options_map = {f"{r['nome']} ({r['preco']:.2f} {currency} | {r['views']} views)": r for _, r in df_creations.iterrows()}
-        all_labels = list(options_map.keys())
-        select_all = st.checkbox("Selecionar todos")
-        selected_labels = st.multiselect("Modelos alvo", all_labels, default=all_labels if select_all else [])
-
-        st.divider()
-        col_act1, col_act2, col_act3 = st.columns(3)
-
-        with col_act1:
-            st.markdown("### 🏷️ Preços")
-            price_mode = st.radio("Modo", ["Ajuste Percentual (%)", "Preço Fixo Novo"])
-            price_val = st.number_input("Valor", value=0.0, step=0.5)
-            if st.button("Aplicar Preços", type="primary", use_container_width=True) and selected_labels:
-                for label in selected_labels:
-                    row = options_map[label]
-                    new_p = round(row["preco"] * (1.0 + price_val / 100.0), 2) if price_mode == "Ajuste Percentual (%)" else round(price_val, 2)
-                    client.update_creation(creation_id=row["id"], price=max(0.0, new_p), currency=currency)
-                st.session_state.creations = client.get_all_my_creations(currency=currency)
-                st.success("Preços atualizados!")
-                st.rerun()
-
-        with col_act2:
-            st.markdown("### 🔥 Descontos")
-            disc_pct = st.slider("Desconto (%)", 5, 90, 20, 5)
-            disc_days = st.number_input("Duração (dias)", 1, 90, 7)
-            if st.button("Ativar Desconto", type="primary", use_container_width=True) and selected_labels:
-                end_at = (datetime.now(timezone.utc) + timedelta(days=int(disc_days))).strftime("%Y-%m-%dT%H:%M:%SZ")
-                for label in selected_labels:
-                    client.create_discount(creation_id=options_map[label]["id"], percentage=disc_pct, end_at_iso=end_at)
-                st.success(f"Desconto de {disc_pct}% ativo!")
-
-        with col_act3:
-            st.markdown("### 🔖 Tags SEO")
-            tag_mode = st.radio("Ação", ["Adicionar às existentes", "Substituir todas"])
-            tags_input = st.text_input("Tags (vírgula)")
-            if st.button("Atualizar Tags", type="primary", use_container_width=True) and selected_labels and tags_input.strip():
-                new_tags = [t.strip() for t in tags_input.split(",") if t.strip()]
-                for label in selected_labels:
-                    row = options_map[label]
-                    merged = list(dict.fromkeys(row["tags_list"] + new_tags)) if tag_mode == "Adicionar às existentes" else new_tags
-                    client.update_creation(creation_id=row["id"], tags=merged)
-                st.session_state.creations = client.get_all_my_creations(currency=currency)
-                st.success("Tags atualizadas!")
-                st.rerun()
-
-
-# ==============================================================================
 # ABA 5: RADAR DE MERCADO & EXTRATOR DE N-GRAMS
 # ==============================================================================
 with tab_market:
     st.subheader("🔍 Radar de Nichos & Mineração de Keywords (N-Grams)")
     r_c1, r_c2, r_c3, r_c4 = st.columns([2.5, 1.2, 1, 1])
-    m_query = r_c1.text_input("Nicho / Palavra-chave *", placeholder="Ex: seat leon, gauge pod, articulated dragon")
+    m_query = r_c1.text_input("Nicho / Palavra-chave *", placeholder="Ex: seat leon, gauge pod, trim clip")
     m_price_filter = r_c2.selectbox("Filtro", ["Apenas Pagos", "Todos (Pagos + Grátis)", "Apenas Gratuitos"])
     m_limit = r_c3.number_input("Amostra", 10, 100, 40, 10)
     m_sort = r_c4.selectbox("Ordenar por", ["Receita Estimada", "Downloads", "Likes", "Views", "Preço"])
@@ -3008,10 +3421,9 @@ with tab_market:
                             st.code(", ".join(f"{g} ({c}x)" for g, c in trigrams), language=None)
 
                     with ng2:
-                        st.markdown("#### 🏷️ Top Tags Prontas a Copiar")
+                        st.markdown("#### 🏷️ Top 20 Tags dos Líderes Prontas a Copiar")
                         if all_niche_tags:
-                            top_tags = [t for t, _ in Counter(all_niche_tags).most_common(15)]
-                            st.caption("Copia estas tags para os teus modelos deste nicho:")
+                            top_tags = [t for t, _ in Counter(all_niche_tags).most_common(20)]
                             st.code(", ".join(top_tags), language=None)
 
                     sort_map = {"Receita Estimada": "receita_est", "Downloads": "downloads", "Likes": "likes", "Views": "views", "Preço": "preco"}
