@@ -141,7 +141,7 @@ def next_golden_hour_utc() -> datetime:
 # MOTOR DE INTELIGÊNCIA ARTIFICIAL (GOOGLE GEMINI FREE API + VISÃO)
 # ==============================================================================
 class GeminiGrowthAI:
-    MODELS = ["gemini-2.5-flash", "gemini-2.0-flash"]
+    MODELS = ["gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-4-hydrogen"]
 
     @staticmethod
     def get_api_key() -> str:
@@ -176,7 +176,7 @@ class GeminiGrowthAI:
             "contents": [{"parts": parts}],
             "generationConfig": {
                 "temperature": 0.45,
-                "maxOutputTokens": 1800,
+                "maxOutputTokens": 4096,
             },
         }
         if expect_json:
