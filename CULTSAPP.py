@@ -5,13 +5,13 @@ import os
 import re
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 import requests
 import streamlit as st
 
 st.set_page_config(
-    page_title="Cults3D Studio Pro & Bot",
+    page_title="Cults3D Studio Pro & Growth Bot",
     page_icon="🧊",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -24,7 +24,7 @@ st.markdown(
     """
     <style>
     .block-container {
-        padding-top: 1.5rem;
+        padding-top: 1.4rem;
         padding-bottom: 2rem;
     }
     div[data-testid="stMetric"] {
@@ -42,7 +42,7 @@ st.markdown(
     }
     .stTabs [data-baseweb="tab"] {
         border-radius: 8px 8px 0 0;
-        padding: 8px 16px;
+        padding: 8px 14px;
         font-weight: 600;
     }
     .seo-card {
@@ -59,10 +59,22 @@ st.markdown(
 
 
 # ==============================================================================
-# UTILITÁRIOS GRAPHQL & PERSISTÊNCIA EM DISCO
+# UTILITÁRIOS GRAPHQL, SECRETS & PERSISTÊNCIA
 # ==============================================================================
 class CultsAPIError(Exception):
     pass
+
+
+def get_secret_val(key: str, default: str = "") -> str:
+    val = os.getenv(key, "").strip()
+    if val:
+        return val
+    try:
+        if key in st.secrets:
+            return str(st.secrets[key]).strip()
+    except Exception:
+        pass
+    return default
 
 
 def unwrap_gql_type(type_obj: Optional[Dict[str, Any]]) -> str:
@@ -89,6 +101,24 @@ def get_state_file_path() -> str:
 
 
 STATE_FILE = get_state_file_path()
+
+
+def next_golden_hour_utc() -> datetime:
+    """Calcula a próxima Hora de Ouro (Sexta 18:00 ou Domingo 15:00 hora local) em UTC."""
+    now_local = datetime.now().astimezone()
+    candidates: List[datetime] = []
+    for days_ahead in range(0, 8):
+        day_dt = now_local + timedelta(days=days_ahead)
+        if day_dt.weekday() == 4:  # Sexta-feira 18:00
+            cand = day_dt.replace(hour=18, minute=0, second=0, microsecond=0)
+            if cand > now_local + timedelta(minutes=15):
+                candidates.append(cand)
+        elif day_dt.weekday() == 6:  # Domingo 15:00
+            cand = day_dt.replace(hour=15, minute=0, second=0, microsecond=0)
+            if cand > now_local + timedelta(minutes=15):
+                candidates.append(cand)
+    chosen = min(candidates) if candidates else (now_local + timedelta(hours=2))
+    return chosen.astimezone(timezone.utc)
 
 
 # ==============================================================================
@@ -484,11 +514,9 @@ class Cults3DClient:
         only_priced: bool = False,
         currency: str = "EUR",
     ) -> Dict[str, Any]:
-        """Pesquisa rigorosa no mercado com paginação e prioridade para creationsSearchBatch."""
         schema = self.get_schema_info()
         queries = schema["queries"]
 
-        # Priorizar sempre creationsSearchBatch quando há termo de pesquisa
         search_field = "creationsSearchBatch"
         if "creationsSearchBatch" not in queries and "creationsBatch" in queries:
             search_field = "creationsBatch"
@@ -708,20 +736,62 @@ class Cults3DClient:
 
 
 # ==============================================================================
-# MOTOR DO BOT AUTÓNOMO (10 MÓDULOS + COMANDOS TELEGRAM + PERSISTÊNCIA)
+# HELPERS DE MARKETING & KIT SOCIAL TELEGRAM
+# ==============================================================================
+def build_social_promo_kit(
+    name: str,
+    url: str,
+    price: float,
+    currency: str,
+    is_promo: bool = False,
+    discount_pct: int = 0,
+) -> str:
+    price_tag = (
+        f"🔥 {discount_pct}% OFF right now!"
+        if is_promo
+        else ("🆓 FREE STL download!" if price == 0 else f"Available for {price:.2f} {currency}")
+    )
+    reddit_post = (
+        f"[3D Print] {name} — {price_tag}\n"
+        f"Designed for clean, reliable printing. Full print settings & STL files here: {url}"
+    )
+    return (
+        f"📣 <b>Kit de Divulgação Pronto a Colar:</b>\n"
+        f"<code>{reddit_post}</code>"
+    )
+
+
+def build_post_sale_reply(buyer_nick: str, model_name: str) -> str:
+    clean_buyer = buyer_nick if buyer_nick and buyer_nick != "Anónimo" else "maker"
+    msg = (
+        f"Hi {clean_buyer}! Thank you so much for downloading '{model_name}'. "
+        f"If you print it, I'd love to see a Make photo on Cults3D! Feel free to reach out if you need any print tips."
+    )
+    return (
+        f"💬 <b>Mensagem Pós-Venda (copiar e enviar no perfil):</b>\n"
+        f"<code>{msg}</code>"
+    )
+
+
+# ==============================================================================
+# MOTOR DO BOT AUTÓNOMO (ANTI-SLEEP + GROWTH ENGINE + PERSISTÊNCIA)
 # ==============================================================================
 class CultsBotEngine:
     DEFAULT_CONFIG: Dict[str, Any] = {
         "interval_minutes": 15,
         "dry_run": True,
         "max_actions_per_cycle": 5,
+        "app_url": "",
+        "anti_sleep_enabled": True,
         "tg_token": "",
         "tg_chat_id": "",
         "tg_remote_commands": True,
         "discord_webhook": "",
-        # 1. Vendas & Milestones
+        # 1. Vendas, Marcos & Assistente Pós-Venda
         "rule_sales_alert": True,
         "rule_milestone_alert": True,
+        "rule_post_sale_script": True,
+        "rule_social_kit": True,
         # 2. Picos de Tráfego
         "rule_spike_alert": True,
         "spike_views_threshold": 35,
@@ -731,7 +801,7 @@ class CultsBotEngine:
         "promo_discount_pct": 20,
         "promo_days": 3,
         "promo_cooldown_days": 14,
-        # 4. Reativação de Modelos Estagnados (tinham vendas, pararam)
+        # 4. Reativação de Modelos Estagnados
         "rule_stagnant_revival": False,
         "stagnant_days": 30,
         "stagnant_discount_pct": 25,
@@ -743,21 +813,24 @@ class CultsBotEngine:
         "price_max_cap": 15.0,
         # 6. Promoção Relâmpago de Fim de Semana
         "rule_weekend_flash": False,
-        "weekend_day": 4,  # 4 = Sexta-feira
+        "weekend_day": 4,
         "weekend_hour": 18,
         "weekend_discount_pct": 20,
         "weekend_days": 3,
-        # 7. Otimizador SEO & Rodapé
+        # 7. Vitrine Dinâmica de Cross-Selling
+        "rule_dynamic_showcase": False,
+        "showcase_top_n": 3,
+        "showcase_title": "Top Popular Designs by FSDesigns:",
+        # 8. Otimizador SEO & Rodapé
         "rule_seo_optimizer": False,
         "seo_footer_marker": "--- FSDesigns ---",
         "seo_footer_text": "\n\n--- FSDesigns ---\nDesigned for reliable 3D printing (PETG / ABS / ASA recommended for automotive parts). Follow our profile for new functional designs!",
         "seo_required_tags": "stl, 3d print",
-        # 8. Fila de Publicação Agendada
+        # 9. Fila de Publicação Agendada
         "rule_queue_publisher": True,
-        # 9. Radar de Nichos
+        # 10. Radar de Nichos & Relatórios
         "rule_market_watch": False,
         "watch_keywords": "",
-        # 10. Relatório Diário & Semanal
         "rule_daily_report": True,
         "daily_report_hour": 21,
         "rule_weekly_report": True,
@@ -772,6 +845,7 @@ class CultsBotEngine:
             "overview": "Custom functional automotive part engineered for OEM+ fitment and durability.",
             "print_settings": "- Material: ASA, ABS or PETG (mandatory for cabin/engine bay heat resistance)\n- Layer height: 0.20 mm\n- Infill: 30% - 40% Gyroid\n- Perimeters/Walls: 4 walls\n- Supports: Tree supports only on critical overhangs",
             "assembly": "Test-fit before final installation. Clean mounting surface with isopropyl alcohol if using automotive double-sided tape.",
+            "faq": "- Will it warp in summer heat? Print in ASA, ABS or PETG (avoid PLA inside vehicles).\n- Need extra hardware? Designed for direct OEM-style fitment.",
             "license": "Personal use only. Contact FSDesigns for commercial printing rights.",
         },
         "Gadgets & Articulados (PLA)": {
@@ -782,6 +856,7 @@ class CultsBotEngine:
             "overview": "Print-in-place articulated model designed for smooth movement right off the build plate with zero assembly.",
             "print_settings": "- Material: PLA / PLA+ / Silk PLA\n- Layer height: 0.16 mm - 0.20 mm\n- Infill: 15% Gyroid\n- Supports: None required (Print-in-Place)\n- Brim: Only if bed adhesion is weak",
             "assembly": "Gently flex joints after cooling to break any minor tolerance bridges.",
+            "faq": "- Does it need supports? Zero supports required.\n- Can I scale it down? Tested down to 80% scale with 0.4 mm nozzle.",
             "license": "Personal use only. Do not redistribute or sell STL files.",
         },
         "Organização & Oficina (PLA / PETG)": {
@@ -792,6 +867,7 @@ class CultsBotEngine:
             "overview": "Heavy-duty organizer and mount engineered for clean workspace storage and fast printing.",
             "print_settings": "- Material: PETG or PLA+\n- Layer height: 0.24 mm (0.4 mm or 0.6 mm nozzle)\n- Infill: 20% Grid/Gyroid\n- Perimeters: 3 walls\n- Supports: None",
             "assembly": "Mounts using standard countersunk wood/wall screws.",
+            "faq": "- Fits standard screws? Yes, 3.5 mm to 4.5 mm countersunk screws.",
             "license": "Personal use only.",
         },
     }
@@ -813,6 +889,8 @@ class CultsBotEngine:
         self.celebrated_milestones: List[str] = []
         self.promo_cooldowns: Dict[str, str] = {}
         self.price_tiers_applied: Dict[str, int] = {}
+        self.early_bird_rules: Dict[str, Dict[str, Any]] = {}
+        self.ab_tests: Dict[str, Dict[str, Any]] = {}
         self.seo_processed_ids: List[str] = []
         self.seen_market_ids: List[str] = []
         self.market_seeded: bool = False
@@ -823,12 +901,36 @@ class CultsBotEngine:
         self.last_weekly_report_week: str = ""
         self.last_weekend_flash_week: str = ""
         self.tg_last_update_id: int = 0
+        self.last_keepalive_ts: Optional[str] = None
+        self.keepalive_status: str = "A aguardar URL"
         self.publish_queue: List[Dict[str, Any]] = []
         self.action_history: List[Dict[str, Any]] = []
         self.logs: List[Dict[str, str]] = []
         self.last_run: Optional[str] = None
 
         self._load_state()
+        self._apply_env_overrides()
+
+    def _apply_env_overrides(self):
+        with self._lock:
+            if get_secret_val("TG_TOKEN"):
+                self.config["tg_token"] = get_secret_val("TG_TOKEN")
+            if get_secret_val("TG_CHAT_ID"):
+                self.config["tg_chat_id"] = get_secret_val("TG_CHAT_ID")
+            if get_secret_val("DISCORD_WEBHOOK"):
+                self.config["discord_webhook"] = get_secret_val("DISCORD_WEBHOOK")
+            if get_secret_val("APP_URL"):
+                self.config["app_url"] = get_secret_val("APP_URL")
+            if get_secret_val("WATCH_KEYWORDS"):
+                self.config["watch_keywords"] = get_secret_val("WATCH_KEYWORDS")
+            if get_secret_val("BOT_DRY_RUN"):
+                self.config["dry_run"] = get_secret_val("BOT_DRY_RUN").lower() in ("1", "true", "sim", "yes")
+            if get_secret_val("RULE_AUTO_PROMO"):
+                self.config["rule_auto_promo"] = get_secret_val("RULE_AUTO_PROMO").lower() in ("1", "true", "sim")
+            if get_secret_val("RULE_DYNAMIC_SHOWCASE"):
+                self.config["rule_dynamic_showcase"] = get_secret_val("RULE_DYNAMIC_SHOWCASE").lower() in ("1", "true", "sim")
+            if get_secret_val("RULE_DYNAMIC_PRICE"):
+                self.config["rule_dynamic_price"] = get_secret_val("RULE_DYNAMIC_PRICE").lower() in ("1", "true", "sim")
 
     def _load_state(self):
         if not os.path.exists(STATE_FILE):
@@ -846,6 +948,8 @@ class CultsBotEngine:
                 self.celebrated_milestones = list(data.get("celebrated_milestones") or [])
                 self.promo_cooldowns = dict(data.get("promo_cooldowns") or {})
                 self.price_tiers_applied = dict(data.get("price_tiers_applied") or {})
+                self.early_bird_rules = dict(data.get("early_bird_rules") or {})
+                self.ab_tests = dict(data.get("ab_tests") or {})
                 self.seo_processed_ids = list(data.get("seo_processed_ids") or [])
                 self.seen_market_ids = list(data.get("seen_market_ids") or [])
                 self.market_seeded = bool(data.get("market_seeded", False))
@@ -866,13 +970,18 @@ class CultsBotEngine:
     def _save_state(self):
         with self._lock:
             payload = {
-                "config": self.config,
+                "config": {
+                    k: v for k, v in self.config.items()
+                    if k not in ("tg_token", "tg_chat_id", "discord_webhook")
+                },
                 "presets": self.presets,
                 "seen_sale_ids": self.seen_sale_ids[-2500:],
                 "sales_seeded": self.sales_seeded,
                 "celebrated_milestones": self.celebrated_milestones[-1000:],
                 "promo_cooldowns": self.promo_cooldowns,
                 "price_tiers_applied": self.price_tiers_applied,
+                "early_bird_rules": self.early_bird_rules,
+                "ab_tests": self.ab_tests,
                 "seo_processed_ids": self.seo_processed_ids[-2500:],
                 "seen_market_ids": self.seen_market_ids[-3000:],
                 "market_seeded": self.market_seeded,
@@ -1012,13 +1121,40 @@ class CultsBotEngine:
 
         if discord_url:
             try:
-                clean_text = text.replace("<b>", "**").replace("</b>", "**")
+                clean_text = text.replace("<b>", "**").replace("</b>", "**").replace("<code>", "`").replace("</code>", "`")
                 requests.post(discord_url, json={"content": clean_text}, timeout=10)
             except Exception as exc:
                 self.log("ERRO", f"Falha Discord: {exc}")
 
+    def ping_keep_alive(self):
+        """Envia ping HTTP para o próprio URL público do Streamlit Cloud para impedir hibernação."""
+        with self._lock:
+            if not self.config.get("anti_sleep_enabled", True):
+                self.keepalive_status = "Desativado"
+                return
+            raw_url = str(self.config.get("app_url", "")).strip()
+
+        if not raw_url:
+            with self._lock:
+                self.keepalive_status = "Falta APP_URL"
+            return
+
+        sep = "&" if "?" in raw_url else "?"
+        target_url = f"{raw_url.rstrip('/')}{sep}health=1"
+        try:
+            resp = requests.get(
+                target_url,
+                headers={"User-Agent": "Mozilla/5.0 (compatible; Cults3DKeepAlive/1.0)"},
+                timeout=12,
+            )
+            with self._lock:
+                self.last_keepalive_ts = datetime.now().strftime("%H:%M:%S")
+                self.keepalive_status = f"OK ({resp.status_code}) às {self.last_keepalive_ts}"
+        except Exception as exc:
+            with self._lock:
+                self.keepalive_status = f"Falha: {exc}"
+
     def poll_telegram_commands(self):
-        """Escuta comandos enviados pelo dono no Telegram (/status, /vendas, /top, /ciclo, /pausar, /retomar)."""
         with self._lock:
             if not self.config.get("tg_remote_commands", True):
                 return
@@ -1063,8 +1199,9 @@ class CultsBotEngine:
                     state_lbl = "🟢 ATIVO" if self.running else "🔴 PAUSADO"
                     mode_lbl = "🧪 Simulação" if self.config.get("dry_run") else "⚡ Real"
                     self.send_notification(
-                        f"🤖 <b>Estado Cults3D Bot</b>\n"
+                        f"🤖 <b>Estado Cults3D Studio Pro</b>\n"
                         f"Estado: {state_lbl} ({mode_lbl})\n"
+                        f"Anti-Sleep: {self.keepalive_status}\n"
                         f"Último ciclo: {self.last_run or 'Nunca'}\n"
                         f"Quota API hoje: {gov['calls_today']}/{gov['daily_soft_limit']}"
                     )
@@ -1077,7 +1214,7 @@ class CultsBotEngine:
                 elif cmd == "/ciclo":
                     self.send_notification("⚡ A executar ciclo manual agora...")
                     threading.Thread(target=self.run_cycle, daemon=True).start()
-                elif cmd in ("/vendas", "/top") and user and key:
+                elif cmd in ("/vendas", "/top", "/kit") and user and key:
                     c_api = Cults3DClient(user, key)
                     if cmd == "/vendas":
                         sales = c_api.get_all_my_sales(currency=curr)[:5]
@@ -1100,6 +1237,13 @@ class CultsBotEngine:
                                 f"{idx}. {item.get('name')} — {item.get('viewsCount')} views | {item.get('downloadsCount')} dl"
                             )
                         self.send_notification("\n".join(lines))
+                    elif cmd == "/kit":
+                        creations = c_api.get_all_my_creations(currency=curr)
+                        if creations:
+                            best = max(creations, key=lambda x: int(x.get("viewsCount") or 0))
+                            p_val = ((best.get("price") or {}).get("cents") or 0) / 100.0
+                            kit = build_social_promo_kit(best.get("name", ""), best.get("url", ""), p_val, curr)
+                            self.send_notification(kit)
 
             with self._lock:
                 self.tg_last_update_id = max_id
@@ -1125,6 +1269,8 @@ class CultsBotEngine:
         self.log("INFO", "Bot contínuo parado.")
 
     def _loop(self):
+        # Ping inicial imediato ao arrancar
+        self.ping_keep_alive()
         while True:
             with self._lock:
                 if not self.running:
@@ -1137,6 +1283,10 @@ class CultsBotEngine:
                 with self._lock:
                     if not self.running:
                         return
+                # Auto-ping a cada 4 minutos (240s) para impedir hibernação do servidor
+                if step > 0 and step % 240 == 0:
+                    self.ping_keep_alive()
+                # Escutar comandos Telegram a cada 6 segundos
                 if step % 6 == 0:
                     self.poll_telegram_commands()
                 time.sleep(1)
@@ -1174,10 +1324,11 @@ class CultsBotEngine:
             self.log("CICLO", f"A iniciar ciclo autónomo {mode_tag}...")
 
             # ------------------------------------------------------------------
-            # 1. VENDAS & MARCOS (MILESTONES)
+            # 1. VENDAS, MARCOS & ASSISTENTE PÓS-VENDA
             # ------------------------------------------------------------------
             sales = client.get_all_my_sales(currency=curr)
             sales_count_map: Dict[str, int] = {}
+            sales_rev_map: Dict[str, float] = {}
             last_sale_date_map: Dict[str, str] = {}
             today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             today_sales_count = 0
@@ -1186,13 +1337,16 @@ class CultsBotEngine:
             for s in sales:
                 cr_id = str((s.get("creation") or {}).get("id") or "")
                 created_at = str(s.get("createdAt") or "")
+                inc_cents = (s.get("income") or {}).get("cents") or 0
+                inc_eur = inc_cents / 100.0
                 if cr_id:
                     sales_count_map[cr_id] = sales_count_map.get(cr_id, 0) + 1
+                    sales_rev_map[cr_id] = round(sales_rev_map.get(cr_id, 0.0) + inc_eur, 2)
                     if created_at > last_sale_date_map.get(cr_id, ""):
                         last_sale_date_map[cr_id] = created_at
                 if created_at.startswith(today_str):
                     today_sales_count += 1
-                    today_revenue += ((s.get("income") or {}).get("cents") or 0) / 100.0
+                    today_revenue += inc_eur
 
             if cfg.get("rule_sales_alert", True):
                 seen_set = set(self.seen_sale_ids)
@@ -1223,10 +1377,12 @@ class CultsBotEngine:
                             f"👤 <b>Comprador:</b> {buyer}\n"
                             f"🏆 <b>Total deste modelo:</b> {total_model_sales} vendas"
                         )
+                        if cfg.get("rule_post_sale_script", True):
+                            msg += "\n\n" + build_post_sale_reply(buyer, m_name)
+
                         self.log("VENDA", f"Nova venda: '{m_name}' (+{inc_val:.2f} {curr}) por {buyer}.")
                         self.send_notification(msg)
 
-                        # Celebração de Marcos
                         if cfg.get("rule_milestone_alert") and total_model_sales in (5, 10, 25, 50, 100, 250):
                             m_key = f"{cr_id}_sales_{total_model_sales}"
                             if m_key not in self.celebrated_milestones:
@@ -1240,13 +1396,31 @@ class CultsBotEngine:
                         self.seen_sale_ids = list(seen_set)
 
             # ------------------------------------------------------------------
-            # 2. CATÁLOGO: TRÁFEGO, AUTO-PROMO, REATIVAÇÃO, PREÇO, FIM DE SEMANA, SEO
+            # 2. CATÁLOGO: TRÁFEGO, EARLY-BIRD, TESTES A/B, PROMOS, VITRINE & SEO
             # ------------------------------------------------------------------
             creations = client.get_all_my_creations(currency=curr)
             self.seed_baselines_if_needed(creations)
             spike_alerts: List[str] = []
 
-            # Verificar se é hora de Promoção Relâmpago de Fim de Semana
+            # Preparar Vitrine Dinâmica (Top N mais vistos com URL válido)
+            showcase_block = ""
+            top_showcase_ids = set()
+            if cfg.get("rule_dynamic_showcase") and len(creations) > 1:
+                top_n = max(1, min(5, int(cfg.get("showcase_top_n", 3))))
+                ranked = sorted(
+                    [x for x in creations if x.get("url")],
+                    key=lambda x: (sales_count_map.get(str(x.get("id")), 0) * 50) + int(x.get("viewsCount") or 0),
+                    reverse=True,
+                )[:top_n]
+                if ranked:
+                    top_showcase_ids = {str(x["id"]) for x in ranked}
+                    sc_title = str(cfg.get("showcase_title") or "Top Popular Designs:").strip()
+                    lines = ["=== TOP DESIGNS ===", sc_title]
+                    for r_item in ranked:
+                        lines.append(f"• {r_item.get('name')}: {r_item.get('url')}")
+                    lines.append("=== END TOP DESIGNS ===")
+                    showcase_block = "\n".join(lines)
+
             now_local = datetime.now()
             iso_y, iso_w, _ = now_local.isocalendar()
             current_week_key = f"{iso_y}-W{iso_w:02d}"
@@ -1260,12 +1434,14 @@ class CultsBotEngine:
             for c in creations:
                 cid = str(c.get("id"))
                 cname = c.get("name") or cid
+                curl = c.get("url") or ""
                 cdesc = c.get("description") or ""
                 ctags = list(c.get("tags") or [])
                 cviews = int(c.get("viewsCount") or 0)
                 cdowns = int(c.get("downloadsCount") or 0)
                 cprice = round(((c.get("price") or {}).get("cents") or 0) / 100.0, 2)
                 csales = sales_count_map.get(cid, 0)
+                crev = sales_rev_map.get(cid, 0.0)
 
                 # --- Pico de Tráfego ---
                 prev_snap = self.model_snapshots.get(cid)
@@ -1283,7 +1459,81 @@ class CultsBotEngine:
                         "sales": csales,
                     }
 
-                # --- Módulo 3: Auto-Promo Inteligente (0 Vendas) ---
+                # --- Preço Early-Bird de Lançamento ---
+                eb_rule = self.early_bird_rules.get(cid)
+                if eb_rule and not eb_rule.get("completed") and actions_done < max_actions:
+                    target_s = int(eb_rule.get("target_sales", 3))
+                    launch_p = round(float(eb_rule.get("launch_price", cprice)), 2)
+                    reg_p = round(float(eb_rule.get("regular_price", cprice)), 2)
+
+                    if csales >= target_s:
+                        if dry:
+                            self.log("SIMULAÇÃO", f"[Early-Bird] '{cname}' atingiu {csales}/{target_s} vendas -> subiria para {reg_p:.2f} {curr}.")
+                        else:
+                            try:
+                                client.update_creation(creation_id=cid, price=reg_p, currency=curr)
+                                with self._lock:
+                                    eb_rule["completed"] = True
+                                actions_done += 1
+                                self.log("EARLY-BIRD", f"'{cname}' atingiu {csales} vendas! Preço subiu para {reg_p:.2f} {curr}.")
+                                self.record_action("EARLY_BIRD_FIM", cid, cname, f"{launch_p:.2f} -> {reg_p:.2f} {curr}", before_state={"price": launch_p}, after_state={"price": reg_p}, reversible=True)
+                                self.send_notification(f"🚀 <b>Early-Bird Concluído!</b>\nModelo: {cname}\nAtingiu {csales} vendas e subiu para <b>{reg_p:.2f} {curr}</b>!")
+                            except Exception as exc:
+                                self.log("ERRO", f"Falha Early-Bird em '{cname}': {exc}")
+                    elif abs(cprice - launch_p) > 0.01 and not dry:
+                        try:
+                            client.update_creation(creation_id=cid, price=launch_p, currency=curr)
+                            actions_done += 1
+                        except Exception:
+                            pass
+
+                # --- Teste A/B de Preço por RPM ---
+                ab = self.ab_tests.get(cid)
+                if ab and ab.get("phase") in ("A", "B") and actions_done < max_actions:
+                    try:
+                        p_start = datetime.fromisoformat(ab["phase_start"].replace("Z", "+00:00"))
+                        elapsed_days = (datetime.now(timezone.utc) - p_start).total_seconds() / 86400.0
+                        phase_days = float(ab.get("days_per_phase", 7))
+
+                        if elapsed_days >= phase_days:
+                            d_views = max(1, cviews - int(ab.get("start_views", cviews)))
+                            d_rev = max(0.0, crev - float(ab.get("start_rev", crev)))
+                            rpm_val = round((d_rev / d_views) * 1000.0, 2)
+
+                            if ab["phase"] == "A":
+                                price_b = round(float(ab["price_b"]), 2)
+                                if not dry:
+                                    client.update_creation(creation_id=cid, price=price_b, currency=curr)
+                                    with self._lock:
+                                        ab["rpm_a"] = rpm_val
+                                        ab["phase"] = "B"
+                                        ab["phase_start"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                                        ab["start_views"] = cviews
+                                        ab["start_rev"] = crev
+                                    actions_done += 1
+                                    self.log("TESTE A/B", f"'{cname}': Fase A concluída (RPM={rpm_val}). A iniciar Fase B ({price_b:.2f} {curr}).")
+                                    self.send_notification(f"🧪 <b>Teste A/B — Fase B Iniciada</b>\nModelo: {cname}\nRPM Preço A: {rpm_val} {curr}/1k\nNovo preço em teste: <b>{price_b:.2f} {curr}</b>")
+                            elif ab["phase"] == "B":
+                                rpm_a = float(ab.get("rpm_a", 0.0))
+                                winner = round(float(ab["price_a"] if rpm_a >= rpm_val else ab["price_b"]), 2)
+                                if not dry:
+                                    client.update_creation(creation_id=cid, price=winner, currency=curr)
+                                    with self._lock:
+                                        ab["rpm_b"] = rpm_val
+                                        ab["phase"] = "DONE"
+                                        ab["winner_price"] = winner
+                                    actions_done += 1
+                                    self.log("TESTE A/B", f"'{cname}' concluído! Vencedor: {winner:.2f} {curr} (RPM A={rpm_a} vs B={rpm_val}).")
+                                    self.record_action("TESTE_AB_VENCEDOR", cid, cname, f"Preço vencedor: {winner:.2f} {curr}", before_state={"price": cprice}, after_state={"price": winner}, reversible=True)
+                                    self.send_notification(
+                                        f"🏆 <b>Teste A/B Concluído!</b>\nModelo: {cname}\n"
+                                        f"RPM A ({ab['price_a']:.2f}): {rpm_a} | RPM B ({ab['price_b']:.2f}): {rpm_val}\n"
+                                        f"Preço Vencedor Aplicado: <b>{winner:.2f} {curr}</b>"
+                                    )
+                    except Exception as exc:
+                        self.log("ERRO", f"Falha Teste A/B em '{cname}': {exc}")
+
+                # --- Auto-Promo Inteligente (0 Vendas) ---
                 if (
                     actions_done < max_actions
                     and cfg.get("rule_auto_promo")
@@ -1308,7 +1558,10 @@ class CultsBotEngine:
                             actions_done += 1
                             self.log("PROMO", f"Desconto {pct}% por {days}d em '{cname}'.")
                             self.record_action("AUTO_PROMO", cid, cname, f"Desconto {pct}% por {days}d")
-                            self.send_notification(f"🔥 <b>Auto-Promo Ativada</b>\nModelo: {cname}\nDesconto: {pct}% ({days} dias)")
+                            promo_msg = f"🔥 <b>Auto-Promo Ativada</b>\nModelo: {cname}\nDesconto: {pct}% ({days} dias)"
+                            if cfg.get("rule_social_kit", True) and curl:
+                                promo_msg += "\n\n" + build_social_promo_kit(cname, curl, cprice, curr, is_promo=True, discount_pct=pct)
+                            self.send_notification(promo_msg)
                         except Exception as exc:
                             with self._lock:
                                 self.promo_cooldowns[cid] = (
@@ -1316,7 +1569,7 @@ class CultsBotEngine:
                                 ).strftime("%Y-%m-%dT%H:%M:%SZ")
                             self.log("AVISO", f"Auto-Promo ignorada em '{cname}': {exc}")
 
-                # --- Módulo 4: Reativação de Modelos Estagnados ---
+                # --- Reativação de Modelos Estagnados ---
                 if (
                     actions_done < max_actions
                     and cfg.get("rule_stagnant_revival")
@@ -1335,10 +1588,7 @@ class CultsBotEngine:
                                 end_iso = (datetime.now(timezone.utc) + timedelta(days=s_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
                                 cd_until = (datetime.now(timezone.utc) + timedelta(days=21)).strftime("%Y-%m-%dT%H:%M:%SZ")
                                 if dry:
-                                    self.log(
-                                        "SIMULAÇÃO",
-                                        f"[Reativação] '{cname}' sem vendas há {days_since}d -> desconto {s_pct}%.",
-                                    )
+                                    self.log("SIMULAÇÃO", f"[Reativação] '{cname}' sem vendas há {days_since}d -> desconto {s_pct}%.")
                                 else:
                                     client.create_discount(cid, s_pct, end_iso)
                                     with self._lock:
@@ -1349,8 +1599,14 @@ class CultsBotEngine:
                         except Exception:
                             pass
 
-                # --- Módulo 5: Preço Dinâmico por Procura ---
-                if actions_done < max_actions and cfg.get("rule_dynamic_price") and cprice > 0:
+                # --- Preço Dinâmico por Procura ---
+                if (
+                    actions_done < max_actions
+                    and cfg.get("rule_dynamic_price")
+                    and cprice > 0
+                    and cid not in self.early_bird_rules
+                    and cid not in self.ab_tests
+                ):
                     step_sales = max(1, int(cfg.get("price_step_sales", 10)))
                     earned_tiers = csales // step_sales
                     applied_tiers = int(self.price_tiers_applied.get(cid, 0))
@@ -1361,10 +1617,7 @@ class CultsBotEngine:
                         new_price = min(round(max_cap, 2), round(cprice * (1.0 + bump_pct / 100.0), 2))
                         if new_price > cprice:
                             if dry:
-                                self.log(
-                                    "SIMULAÇÃO",
-                                    f"[Preço Dinâmico] '{cname}': {cprice:.2f} -> {new_price:.2f} {curr} ({csales} vendas).",
-                                )
+                                self.log("SIMULAÇÃO", f"[Preço Dinâmico] '{cname}': {cprice:.2f} -> {new_price:.2f} {curr} ({csales} vendas).")
                             else:
                                 try:
                                     client.update_creation(creation_id=cid, price=new_price, currency=curr)
@@ -1372,22 +1625,12 @@ class CultsBotEngine:
                                         self.price_tiers_applied[cid] = earned_tiers
                                     actions_done += 1
                                     self.log("PREÇO", f"'{cname}': {cprice:.2f} -> {new_price:.2f} {curr}.")
-                                    self.record_action(
-                                        "PREÇO_DINÂMICO",
-                                        cid,
-                                        cname,
-                                        f"{cprice:.2f} -> {new_price:.2f} {curr}",
-                                        before_state={"price": cprice},
-                                        after_state={"price": new_price},
-                                        reversible=True,
-                                    )
-                                    self.send_notification(
-                                        f"📈 <b>Preço Atualizado</b>\nModelo: {cname}\n{cprice:.2f} ➔ <b>{new_price:.2f} {curr}</b>"
-                                    )
+                                    self.record_action("PREÇO_DINÂMICO", cid, cname, f"{cprice:.2f} -> {new_price:.2f} {curr}", before_state={"price": cprice}, after_state={"price": new_price}, reversible=True)
+                                    self.send_notification(f"📈 <b>Preço Atualizado</b>\nModelo: {cname}\n{cprice:.2f} ➔ <b>{new_price:.2f} {curr}</b>")
                                 except Exception as exc:
                                     self.log("ERRO", f"Falha preço em '{cname}': {exc}")
 
-                # --- Módulo 6: Promoção Relâmpago de Fim de Semana ---
+                # --- Promoção Relâmpago de Fim de Semana ---
                 if trigger_weekend_flash and cprice > 0 and not self._is_in_promo_cooldown(cid):
                     w_pct = int(cfg.get("weekend_discount_pct", 20))
                     w_days = int(cfg.get("weekend_days", 3))
@@ -1403,8 +1646,25 @@ class CultsBotEngine:
                         except Exception:
                             pass
 
-                # --- Módulo 7: Otimizador SEO & Rodapé ---
-                if actions_done < max_actions and cfg.get("rule_seo_optimizer") and cid not in self.seo_processed_ids:
+                # --- Vitrine Dinâmica & Otimizador SEO/Rodapé (combinados numa única chamada updateCreation) ---
+                new_desc_candidate = cdesc
+                desc_modified = False
+
+                if showcase_block and cid not in top_showcase_ids:
+                    cleaned_desc = re.sub(
+                        r"\n*=== TOP DESIGNS ===.*?=== END TOP DESIGNS ===\n*",
+                        "\n\n",
+                        new_desc_candidate,
+                        flags=re.DOTALL,
+                    ).strip()
+                    composed = f"{cleaned_desc}\n\n{showcase_block}".strip()
+                    if composed != new_desc_candidate.strip():
+                        new_desc_candidate = composed
+                        desc_modified = True
+
+                new_tags_candidate = ctags
+                tags_modified = False
+                if cfg.get("rule_seo_optimizer") and cid not in self.seo_processed_ids:
                     marker = str(cfg.get("seo_footer_marker", "")).strip()
                     footer = str(cfg.get("seo_footer_text", ""))
                     req_tags = [
@@ -1412,47 +1672,48 @@ class CultsBotEngine:
                         for t in str(cfg.get("seo_required_tags", "")).split(",")
                         if t.strip()
                     ]
-
-                    updated_desc = cdesc
-                    desc_changed = False
-                    if marker and footer and marker not in cdesc:
-                        updated_desc = (cdesc.rstrip() + footer).strip()
-                        desc_changed = True
+                    if marker and footer and marker not in new_desc_candidate:
+                        new_desc_candidate = (new_desc_candidate.rstrip() + footer).strip()
+                        desc_modified = True
 
                     norm_tags = list(dict.fromkeys([t.strip().lower() for t in ctags if t.strip()]))
                     for rt in req_tags:
                         if rt not in norm_tags:
                             norm_tags.append(rt)
-                    tags_changed = norm_tags != ctags
+                    if norm_tags != ctags:
+                        new_tags_candidate = norm_tags
+                        tags_modified = True
 
-                    if not desc_changed and not tags_changed:
+                    if not desc_modified and not tags_modified:
                         with self._lock:
                             self.seo_processed_ids.append(cid)
+
+                if (desc_modified or tags_modified) and actions_done < max_actions:
+                    if dry:
+                        self.log("SIMULAÇÃO", f"[Vitrine/SEO] Atualizaria descrição/tags em '{cname}'.")
                     else:
-                        if dry:
-                            self.log("SIMULAÇÃO", f"[SEO] Atualizaria '{cname}' (rodapé={desc_changed}, tags={tags_changed}).")
-                        else:
-                            try:
-                                client.update_creation(
-                                    creation_id=cid,
-                                    description=updated_desc if desc_changed else None,
-                                    tags=norm_tags if tags_changed else None,
-                                )
+                        try:
+                            client.update_creation(
+                                creation_id=cid,
+                                description=new_desc_candidate if desc_modified else None,
+                                tags=new_tags_candidate if tags_modified else None,
+                            )
+                            if cfg.get("rule_seo_optimizer") and cid not in self.seo_processed_ids:
                                 with self._lock:
                                     self.seo_processed_ids.append(cid)
-                                actions_done += 1
-                                self.log("SEO", f"SEO/Rodapé aplicado em '{cname}'.")
-                                self.record_action(
-                                    "SEO_OTIMIZADOR",
-                                    cid,
-                                    cname,
-                                    f"Rodapé={desc_changed}, Tags={len(norm_tags)}",
-                                    before_state={"description": cdesc, "tags": ctags},
-                                    after_state={"description": updated_desc, "tags": norm_tags},
-                                    reversible=True,
-                                )
-                            except Exception as exc:
-                                self.log("ERRO", f"Falha SEO em '{cname}': {exc}")
+                            actions_done += 1
+                            self.log("VITRINE/SEO", f"Vitrine/SEO atualizado em '{cname}'.")
+                            self.record_action(
+                                "VITRINE_SEO",
+                                cid,
+                                cname,
+                                f"Descrição={desc_modified}, Tags={tags_modified}",
+                                before_state={"description": cdesc, "tags": ctags},
+                                after_state={"description": new_desc_candidate, "tags": new_tags_candidate},
+                                reversible=True,
+                            )
+                        except Exception as exc:
+                            self.log("ERRO", f"Falha Vitrine/SEO em '{cname}': {exc}")
 
             if trigger_weekend_flash and not dry:
                 with self._lock:
@@ -1466,7 +1727,7 @@ class CultsBotEngine:
                 self.send_notification("🚀 <b>Pico de Tráfego Detetado!</b>\n" + "\n".join(spike_alerts[:6]))
 
             # ------------------------------------------------------------------
-            # 3. FILA DE PUBLICAÇÃO AGENDADA
+            # 3. FILA DE PUBLICAÇÃO AGENDADA + KIT DE DIVULGAÇÃO
             # ------------------------------------------------------------------
             if cfg.get("rule_queue_publisher", True) and self.publish_queue:
                 now_utc = datetime.now(timezone.utc)
@@ -1506,7 +1767,10 @@ class CultsBotEngine:
                                     item["published_url"] = pub_url
                                 self.log("PUBLICADO", f"Modelo agendado publicado: '{item['name']}' -> {pub_url}")
                                 self.record_action("PUBLICAÇÃO", str(created.get("id") or "novo"), item["name"], pub_url)
-                                self.send_notification(f"🚀 <b>Modelo Publicado!</b>\n📦 {item['name']}\n🔗 {pub_url}")
+                                pub_msg = f"🚀 <b>Novo Modelo Publicado!</b>\n📦 {item['name']}\n🔗 {pub_url}"
+                                if cfg.get("rule_social_kit", True) and pub_url:
+                                    pub_msg += "\n\n" + build_social_promo_kit(item["name"], pub_url, float(item.get("price", 0.0)), curr)
+                                self.send_notification(pub_msg)
                             except Exception as exc:
                                 with self._lock:
                                     item["status"] = f"Erro: {exc}"
@@ -1514,7 +1778,7 @@ class CultsBotEngine:
                         break
 
             # ------------------------------------------------------------------
-            # 4. RADAR DE NICHOS
+            # 4. RADAR DE NICHOS & OPORTUNIDADES DE COMENTÁRIO
             # ------------------------------------------------------------------
             keywords = [k.strip() for k in str(cfg.get("watch_keywords", "")).split(",") if k.strip()]
             if cfg.get("rule_market_watch") and keywords:
@@ -1535,7 +1799,7 @@ class CultsBotEngine:
                             m_price = ((item.get("price") or {}).get("cents") or 0) / 100.0
                             m_creator = (item.get("creator") or {}).get("nick") or "?"
                             m_url = item.get("url") or ""
-                            found_new_items.append(f"• <b>{m_title}</b> ({m_price:.2f} {curr}) por {m_creator}\n  {m_url}")
+                            found_new_items.append(f"• <b>{m_title}</b> ({m_price:.2f} {curr}) por {m_creator}\n  👉 {m_url}")
 
                 with self._lock:
                     self.seen_market_ids = list(seen_m)
@@ -1545,10 +1809,13 @@ class CultsBotEngine:
 
                 if found_new_items:
                     self.log("RADAR", f"{len(found_new_items)} nova(s) peça(s) no radar.")
-                    self.send_notification("🕵️ <b>Novidades nos Nichos Vigiados</b>\n" + "\n".join(found_new_items[:5]))
+                    self.send_notification(
+                        "🕵️ <b>Novidades nos Nichos (Oportunidade de 1.º Comentário):</b>\n"
+                        + "\n".join(found_new_items[:5])
+                    )
 
             # ------------------------------------------------------------------
-            # 5. RELATÓRIOS DIÁRIO & SEMANAL (COM BASELINE CORRETO)
+            # 5. RELATÓRIOS DIÁRIO & SEMANAL
             # ------------------------------------------------------------------
             local_date_str = now_local.strftime("%Y-%m-%d")
             total_v = sum(int(c.get("viewsCount") or 0) for c in creations)
@@ -1578,7 +1845,6 @@ class CultsBotEngine:
                         self.last_daily_report_date = local_date_str
                     self.log("RELATÓRIO", f"Relatório diário enviado (medição desde {since_time}).")
 
-            # Relatório Semanal ao Domingo a partir das 20h
             if (
                 cfg.get("rule_weekly_report")
                 and creations
@@ -1610,11 +1876,32 @@ class CultsBotEngine:
 
 
 @st.cache_resource
-def get_bot_engine() -> CultsBotEngine:
+def get_bot_engine(version: str = "studio_pro_v4") -> CultsBotEngine:
     return CultsBotEngine()
 
 
-bot = get_bot_engine()
+bot = get_bot_engine("studio_pro_v4")
+if not hasattr(bot, "ping_keep_alive"):
+    try:
+        bot.stop()
+    except Exception:
+        pass
+    get_bot_engine.clear()
+    bot = get_bot_engine("studio_pro_v4")
+
+# Arranque automático via Secrets (Cloud 24/7)
+_srv_user = get_secret_val("CULTS_USERNAME")
+_srv_key = get_secret_val("CULTS_API_KEY")
+if _srv_user and _srv_key:
+    _srv_curr = get_secret_val("CULTS_CURRENCY", "EUR") or "EUR"
+    bot.set_credentials(_srv_user, _srv_key, _srv_curr)
+    if not bot.running:
+        bot.start()
+
+# Resposta ultra-rápida para Pings Anti-Sleep (?health=1)
+if st.query_params.get("health") == "1":
+    st.write("OK")
+    st.stop()
 
 
 # ==============================================================================
@@ -1624,7 +1911,6 @@ def analyze_listing_seo(name: str, description: str, tags: List[str], price: flo
     score = 0
     tips: List[str] = []
 
-    # 1. Título (25 pts)
     n_len = len(name.strip())
     if n_len >= 25:
         score += 25
@@ -1634,7 +1920,6 @@ def analyze_listing_seo(name: str, description: str, tags: List[str], price: flo
     else:
         tips.append("Título demasiado curto. Inclui palavras-chave específicas que os compradores pesquisam.")
 
-    # 2. Descrição (35 pts)
     d_len = len(description.strip())
     if d_len >= 250:
         score += 20
@@ -1650,7 +1935,6 @@ def analyze_listing_seo(name: str, description: str, tags: List[str], price: flo
     else:
         tips.append("Adiciona parâmetros de impressão (material recomendado, altura de camada, suportes e infill).")
 
-    # 3. Tags (30 pts)
     clean_tags = [t.strip().lower() for t in tags if t.strip()]
     if len(clean_tags) >= 8:
         score += 30
@@ -1661,13 +1945,11 @@ def analyze_listing_seo(name: str, description: str, tags: List[str], price: flo
         score += 5
         tips.append("Poucas tags! Usa entre 8 e 15 tags (sinónimos, aplicações, material e categoria).")
 
-    # 4. Preço psicológico (10 pts)
     if price == 0 or (round(price * 100) % 50 == 0 or str(price).endswith(("9", "5"))):
         score += 10
     else:
         score += 6
 
-    # Sugestão automática de tags extraídas do título
     stopwords = {"the", "and", "for", "with", "para", "com", "de", "do", "da", "em", "stl", "3d"}
     words = re.findall(r"[a-zA-Z0-9À-ÿ]{3,}", name.lower())
     suggested_tags = [w for w in dict.fromkeys(words) if w not in stopwords and w not in clean_tags][:8]
@@ -1679,13 +1961,27 @@ def analyze_listing_seo(name: str, description: str, tags: List[str], price: flo
     }
 
 
+def extract_ngrams(titles: List[str], n: int = 2, top_k: int = 10) -> List[Tuple[str, int]]:
+    stopwords = {"the", "and", "for", "with", "stl", "file", "print", "3d", "model", "part", "from"}
+    grams: List[str] = []
+    for title in titles:
+        tokens = [
+            w for w in re.findall(r"[a-z0-9]{2,}", title.lower())
+            if w not in stopwords
+        ]
+        if len(tokens) >= n:
+            for i in range(len(tokens) - n + 1):
+                grams.append(" ".join(tokens[i:i + n]))
+    return Counter(grams).most_common(top_k)
+
+
 # ==============================================================================
 # GESTÃO DE ESTADO DA SESSÃO
 # ==============================================================================
 for key, default in [
-    ("username", os.getenv("CULTS_USERNAME", "")),
-    ("api_key", os.getenv("CULTS_API_KEY", "")),
-    ("currency", "EUR"),
+    ("username", get_secret_val("CULTS_USERNAME", "")),
+    ("api_key", get_secret_val("CULTS_API_KEY", "")),
+    ("currency", get_secret_val("CULTS_CURRENCY", "EUR") or "EUR"),
     ("connected", False),
     ("profile", None),
     ("creations", []),
@@ -1724,7 +2020,7 @@ if not st.session_state.connected:
     with center_col:
         st.title("🧊 Cults3D Studio Pro")
         st.write(
-            "Plataforma completa de Business Intelligence, Publicação SEO, Radar de Nichos e Bot Autónomo para a tua loja Cults3D."
+            "Plataforma completa de Business Intelligence, Growth Engine, Radar N-Gram e Bot Autónomo 24/7 com Anti-Sleep."
         )
 
         with st.form("login_form"):
@@ -1792,7 +2088,10 @@ with st.sidebar:
     )
 
     if bot.running:
-        st.info(f"🤖 Bot: **ATIVO** ({'Simulação' if bot.config['dry_run'] else 'Real'})")
+        st.info(
+            f"🤖 Bot: **ATIVO** ({'Simulação' if bot.config['dry_run'] else 'Real'})\n\n"
+            f"🛡️ Anti-Sleep: `{bot.keepalive_status}`"
+        )
     else:
         st.caption("🤖 Bot: Parado")
 
@@ -1825,13 +2124,6 @@ with st.sidebar:
                 st.rerun()
             except Exception as e:
                 st.error(str(e))
-
-    with st.popover("ℹ️ Guia Rápido & Dicas", use_container_width=True):
-        st.markdown(
-            "**Passar o rato no `?`**: Todos os campos e métricas têm explicação detalhada ao passar o rato.\n\n"
-            "**Medição de Views Diárias**: A API do Cults3D só fornece o contador total acumulado; a app grava a base inicial assim que abres e calcula o ganho diário a partir dessa hora.\n\n"
-            "**Modo Simulação**: Testa todas as regras do bot sem mexer nos teus modelos reais."
-        )
 
     if st.button(
         "🚪 Trocar Conta / API Key",
@@ -1889,10 +2181,10 @@ df_creations, df_sales = build_dataframes()
 
 tab_dash, tab_bot, tab_publish, tab_bulk, tab_market, tab_console = st.tabs([
     "📊 Analytics & BI",
-    "🤖 Bot Autónomo",
+    "🤖 Bot & Growth Engine",
     "🚀 Estúdio Publicação & SEO",
     "⚡ Gestão em Massa",
-    "🔍 Radar de Mercado",
+    "🔍 Radar N-Gram",
     "🛠️ Consola GraphQL",
 ])
 
@@ -1907,43 +2199,17 @@ with tab_dash:
         total_vendas = len(df_sales)
         ticket_medio = (total_receita / total_vendas) if total_vendas > 0 else 0.0
         total_views = int(df_creations["views"].sum())
-        total_downloads = int(df_creations["downloads"].sum())
         conv_rate = (total_vendas / total_views * 100.0) if total_views > 0 else 0.0
         rpm = (total_receita / total_views * 1000.0) if total_views > 0 else 0.0
 
         k1, k2, k3, k4, k5, k6 = st.columns(6)
-        k1.metric(
-            f"Receita Líquida ({currency})",
-            f"{total_receita:,.2f}",
-            help="Valor líquido total ganho após as comissões do Cults3D.",
-        )
-        k2.metric(
-            "Vendas Totais",
-            f"{total_vendas}",
-            help="Número total de transações pagas concluídas na conta.",
-        )
-        k3.metric(
-            f"Ticket Médio ({currency})",
-            f"{ticket_medio:,.2f}",
-            help="Receita líquida média recebida por cada venda.",
-        )
-        k4.metric(
-            "Visualizações",
-            f"{total_views:,}",
-            help="Soma de visualizações de todas as peças do teu portfólio.",
-        )
-        k5.metric(
-            "Conversão Global",
-            f"{conv_rate:.2f}%",
-            help="Percentagem de visualizações que resultam numa venda (Vendas / Views).",
-        )
-        k6.metric(
-            f"RPM ({currency}/1k views)",
-            f"{rpm:,.2f}",
-            help="Receita líquida média gerada por cada 1.000 visualizações.",
-        )
+        k1.metric(f"Receita Líquida ({currency})", f"{total_receita:,.2f}", help="Valor líquido total ganho após comissões.")
+        k2.metric("Vendas Totais", f"{total_vendas}", help="Total de vendas concluídas.")
+        k3.metric(f"Ticket Médio ({currency})", f"{ticket_medio:,.2f}", help="Receita líquida média por venda.")
+        k4.metric("Visualizações", f"{total_views:,}", help="Views acumuladas de todo o catálogo.")
+        k5.metric("Conversão Global", f"{conv_rate:.2f}%", help="Percentagem de views que viram venda.")
+        k6.metric(f"RPM ({currency}/1k)", f"{rpm:,.2f}", help="Receita líquida por cada 1.000 visualizações.")
 
-        # Cruzar vendas com modelos
         if not df_sales.empty:
             sales_by_model = (
                 df_sales.groupby("creation_id")
@@ -1958,14 +2224,9 @@ with tab_dash:
             perf_df["vendas"] = 0
             perf_df["receita"] = 0.0
 
-        perf_df["conversao_%"] = (
-            perf_df["vendas"] / perf_df["views"].replace(0, pd.NA) * 100.0
-        ).fillna(0.0).round(2)
-        perf_df["likes_ratio_%"] = (
-            perf_df["likes"] / perf_df["views"].replace(0, pd.NA) * 100.0
-        ).fillna(0.0).round(1)
+        perf_df["conversao_%"] = (perf_df["vendas"] / perf_df["views"].replace(0, pd.NA) * 100.0).fillna(0.0).round(2)
+        perf_df["likes_ratio_%"] = (perf_df["likes"] / perf_df["views"].replace(0, pd.NA) * 100.0).fillna(0.0).round(1)
 
-        # Classificação Estratégica Automática (Matriz BCG)
         med_views = max(50.0, float(perf_df["views"].median()))
         med_conv = max(0.5, float(perf_df[perf_df["vendas"] > 0]["conversao_%"].median()) if (perf_df["vendas"] > 0).any() else 1.0)
 
@@ -1975,16 +2236,15 @@ with tab_dash:
             if row["views"] >= med_views and row["conversao_%"] >= med_conv and row["vendas"] > 0:
                 return "🏆 Estrela (Best-Seller)"
             if row["views"] < med_views and row["vendas"] > 0:
-                return "💎 Joia Escondida (Precisa Tráfego)"
+                return "💎 Joia Escondida"
             if row["views"] >= med_views and row["vendas"] == 0:
-                return "👀 Muito Visto / 0 Vendas (Rever Preço)"
+                return "👀 Muito Visto / 0 Vendas"
             return "💤 Em Crescimento"
 
         perf_df["estado_bcg"] = perf_df.apply(classify_tier, axis=1)
 
         st.divider()
 
-        # Gráficos Temporais & Comportamento do Comprador
         if not df_sales.empty:
             dt_series = pd.to_datetime(df_sales["data"], utc=True, errors="coerce")
             df_sales["dt_utc"] = dt_series
@@ -1994,61 +2254,31 @@ with tab_dash:
             with c_left:
                 hdr1, hdr2 = st.columns([2, 1])
                 hdr1.subheader("Evolução de Receita")
-                agg_mode = hdr2.selectbox(
-                    "Agrupamento",
-                    ["Dia", "Semana", "Mês", "Acumulado"],
-                    label_visibility="collapsed",
-                    help="Escolhe a escala temporal para analisar o crescimento da tua receita.",
-                )
+                agg_mode = hdr2.selectbox("Agrupamento", ["Dia", "Semana", "Mês", "Acumulado"], label_visibility="collapsed")
                 if not valid_sales.empty:
                     if agg_mode == "Dia":
-                        series_plot = valid_sales.groupby(valid_sales["dt_utc"].dt.date)["receita_liquida"].sum()
-                        st.bar_chart(series_plot)
+                        st.bar_chart(valid_sales.groupby(valid_sales["dt_utc"].dt.date)["receita_liquida"].sum())
                     elif agg_mode == "Semana":
-                        series_plot = valid_sales.groupby(valid_sales["dt_utc"].dt.to_period("W").astype(str))["receita_liquida"].sum()
-                        st.bar_chart(series_plot)
+                        st.bar_chart(valid_sales.groupby(valid_sales["dt_utc"].dt.to_period("W").astype(str))["receita_liquida"].sum())
                     elif agg_mode == "Mês":
-                        series_plot = valid_sales.groupby(valid_sales["dt_utc"].dt.to_period("M").astype(str))["receita_liquida"].sum()
-                        st.bar_chart(series_plot)
+                        st.bar_chart(valid_sales.groupby(valid_sales["dt_utc"].dt.to_period("M").astype(str))["receita_liquida"].sum())
                     else:
-                        daily_s = valid_sales.groupby(valid_sales["dt_utc"].dt.date)["receita_liquida"].sum().cumsum()
-                        st.area_chart(daily_s)
+                        st.area_chart(valid_sales.groupby(valid_sales["dt_utc"].dt.date)["receita_liquida"].sum().cumsum())
 
             with c_right:
                 st.subheader("Melhores Dias de Venda")
                 if not valid_sales.empty:
                     dias_pt = ["Seg", "Ter", "Qua", "Qui", "Sex", "Sáb", "Dom"]
                     valid_sales["dia_sem"] = valid_sales["dt_utc"].dt.dayofweek.map(lambda d: dias_pt[d])
-                    by_day = valid_sales.groupby("dia_sem")["sale_id"].count().reindex(dias_pt, fill_value=0)
-                    st.bar_chart(by_day)
+                    st.bar_chart(valid_sales.groupby("dia_sem")["sale_id"].count().reindex(dias_pt, fill_value=0))
 
         st.divider()
-
-        # Tabela Matriz de Performance
         st.subheader("Matriz de Performance do Catálogo")
-        filter_tier = st.multiselect(
-            "Filtrar por Classificação Estratégica",
-            options=sorted(perf_df["estado_bcg"].unique().tolist()),
-            default=[],
-            help="Filtra os modelos pela categoria automática (Estrelas, Joias Escondidas, Muito Visto sem Vendas, etc.).",
-        )
+        filter_tier = st.multiselect("Filtrar por Diagnóstico", options=sorted(perf_df["estado_bcg"].unique().tolist()))
         view_df = perf_df[perf_df["estado_bcg"].isin(filter_tier)] if filter_tier else perf_df
 
         st.dataframe(
-            view_df[
-                [
-                    "nome",
-                    "estado_bcg",
-                    "preco",
-                    "views",
-                    "likes",
-                    "downloads",
-                    "vendas",
-                    "receita",
-                    "conversao_%",
-                    "url",
-                ]
-            ].sort_values(by=["receita", "views"], ascending=False),
+            view_df[["nome", "estado_bcg", "preco", "views", "likes", "downloads", "vendas", "receita", "conversao_%", "url"]].sort_values(by=["receita", "views"], ascending=False),
             use_container_width=True,
             hide_index=True,
             column_config={
@@ -2061,47 +2291,27 @@ with tab_dash:
             },
         )
 
-        # Inspetor & Editor Rápido Individual
-        with st.expander("🔬 Inspetor & Editor Rápido de Modelo Individual"):
+        with st.expander("🔬 Inspetor & Editor Rápido Individual"):
             model_names_map = {row["nome"]: row for _, row in perf_df.iterrows()}
-            chosen_name = st.selectbox(
-                "Escolhe um modelo para inspecionar e editar diretamente",
-                list(model_names_map.keys()),
-                help="Permite ver o diagnóstico SEO/conversão de uma peça e atualizar preço, título, descrição ou tags.",
-            )
+            chosen_name = st.selectbox("Escolhe um modelo", list(model_names_map.keys()))
             m_row = model_names_map[chosen_name]
             seo_eval = analyze_listing_seo(m_row["nome"], m_row["descricao"], m_row["tags_list"], m_row["preco"])
 
             ic1, ic2, ic3, ic4 = st.columns(4)
-            ic1.metric("SEO Score", f"{seo_eval['score']}/100", help="Pontuação calculada com base no título, descrição e tags.")
-            ic2.metric("Likes / Views", f"{m_row['likes_ratio_%']}%", help="Taxa de interesse visual da capa e renders.")
+            ic1.metric("SEO Score", f"{seo_eval['score']}/100")
+            ic2.metric("Likes / Views", f"{m_row['likes_ratio_%']}%")
             ic3.metric("Diagnóstico", m_row["estado_bcg"].split(" (")[0])
             ic4.metric("Receita Gerada", f"{m_row['receita']:.2f} {currency}")
 
             if seo_eval["tips"]:
-                st.warning("💡 **Sugestões de Melhoria:** " + " | ".join(seo_eval["tips"]))
+                st.warning("💡 **Sugestões:** " + " | ".join(seo_eval["tips"]))
 
             with st.form("quick_edit_single_form"):
-                qe_name = st.text_input("Título", value=m_row["nome"], help="Título público do anúncio no Cults3D.")
-                qe_price = st.number_input(
-                    f"Preço ({currency})",
-                    min_value=0.0,
-                    step=0.5,
-                    value=float(m_row["preco"]),
-                    help="Define 0.00 para tornar gratuito.",
-                )
-                qe_tags = st.text_input(
-                    "Tags (vírgula)",
-                    value=m_row["tags"],
-                    help="Palavras-chave separadas por vírgula.",
-                )
-                qe_desc = st.text_area(
-                    "Descrição",
-                    value=m_row["descricao"],
-                    height=130,
-                    help="Descrição técnica e instruções de impressão.",
-                )
-                if st.form_submit_button("💾 Guardar Alterações neste Modelo", type="primary"):
+                qe_name = st.text_input("Título", value=m_row["nome"])
+                qe_price = st.number_input(f"Preço ({currency})", min_value=0.0, step=0.5, value=float(m_row["preco"]))
+                qe_tags = st.text_input("Tags (vírgula)", value=m_row["tags"])
+                qe_desc = st.text_area("Descrição", value=m_row["descricao"], height=130)
+                if st.form_submit_button("💾 Guardar Alterações", type="primary"):
                     try:
                         client.update_creation(
                             creation_id=m_row["id"],
@@ -2117,223 +2327,145 @@ with tab_dash:
                     except Exception as e:
                         st.error(str(e))
 
-        c_exp1, c_exp2 = st.columns(2)
-        c_exp1.download_button(
-            "⬇️ Exportar Catálogo Completo (CSV)",
-            data=perf_df.drop(columns=["tags_list"], errors="ignore").to_csv(index=False).encode("utf-8"),
-            file_name="cults3d_catalogo_bi.csv",
-            mime="text/csv",
-            help="Descarrega todas as métricas e diagnósticos em formato Excel/CSV.",
-        )
-        if not df_sales.empty:
-            c_exp2.download_button(
-                "⬇️ Exportar Histórico de Vendas (CSV)",
-                data=df_sales.drop(columns=["dt_utc"], errors="ignore").to_csv(index=False).encode("utf-8"),
-                file_name="cults3d_vendas.csv",
-                mime="text/csv",
-                help="Descarrega todas as vendas para contabilidade.",
-            )
-
 
 # ==============================================================================
-# ABA 2: BOT AUTÓNOMO (10 MÓDULOS + TELEGRAM REMOTO + ROLLBACK)
+# ABA 2: BOT AUTÓNOMO & GROWTH ENGINE
 # ==============================================================================
 with tab_bot:
-    st.subheader("🤖 Bot Autónomo Cults3D (10 Módulos + Controlo Remoto)")
-    st.caption(f"Estado persistente guardado em `{STATE_FILE}` — sobrevive a reinícios.")
+    st.subheader("🤖 Bot Autónomo Cults3D (Anti-Sleep + Growth Engine)")
 
-    b1, b2, b3, b4, b5 = st.columns([1, 1, 1, 1, 1.3])
-    b1.metric("Estado", "🟢 ATIVO" if bot.running else "🔴 PARADO", help="Indica se o ciclo automático em segundo plano está ligado.")
-    b2.metric("Modo", "🧪 Simulação" if bot.config["dry_run"] else "⚡ Real", help="Em Simulação o bot apenas regista logs sem alterar preços/descontos.")
-    b3.metric("Fila Agendada", f"{sum(1 for x in bot.publish_queue if x.get('status') == 'Pendente')}", help="Modelos prontos para publicação automática.")
-    b4.metric("Último Ciclo", (bot.last_run or "Nunca").split(" ")[-1], help="Hora da última verificação automática concluída.")
+    b1, b2, b3, b4, b5 = st.columns([1, 1, 1.2, 1, 1.3])
+    b1.metric("Estado", "🟢 ATIVO" if bot.running else "🔴 PARADO")
+    b2.metric("Modo", "🧪 Simulação" if bot.config["dry_run"] else "⚡ Real")
+    b3.metric("Anti-Sleep", bot.keepalive_status, help="Faz ping automático a cada 4 minutos ao link da app para impedir hibernação.")
+    b4.metric("Último Ciclo", (bot.last_run or "Nunca").split(" ")[-1])
 
     with b5:
         if not bot.running:
-            if st.button(
-                "▶️ Iniciar Bot Contínuo",
-                type="primary",
-                use_container_width=True,
-                help="Inicia o motor automático em segundo plano.",
-            ):
+            if st.button("▶️ Iniciar Bot 24/7", type="primary", use_container_width=True):
                 bot.start()
                 st.rerun()
         else:
-            if st.button(
-                "⏹️ Parar Bot",
-                use_container_width=True,
-                help="Pausa a execução automática do bot.",
-            ):
+            if st.button("⏹️ Parar Bot", use_container_width=True):
                 bot.stop()
                 st.rerun()
 
-        if st.button(
-            "⚡ Executar 1 Ciclo Agora",
-            use_container_width=True,
-            help="Força a execução imediata de todos os módulos ativos neste instante.",
-        ):
-            with st.spinner("A executar todos os módulos ativos..."):
+        if st.button("⚡ Correr 1 Ciclo Agora", use_container_width=True):
+            with st.spinner("A executar ciclo completo..."):
                 bot.run_cycle()
             st.rerun()
 
-    sub_rules, sub_tg, sub_queue, sub_rollback, sub_logs = st.tabs([
-        "⚙️ 10 Módulos de Automação",
-        "📱 Comandos Remotos Telegram",
-        "🗓️ Fila de Publicação",
-        "↩️ Histórico & Rollback",
-        "📜 Logs em Direto",
+    sub_rules, sub_growth, sub_tg, sub_queue, sub_rollback, sub_logs = st.tabs([
+        "⚙️ Regras & Anti-Sleep",
+        "🚀 Growth: Early-Bird & Testes A/B",
+        "📱 Comandos Telegram",
+        "🗓️ Fila Agendada",
+        "↩️ Rollback",
+        "📜 Logs",
     ])
 
-    # --- SUB-ABA 1: CONFIGURAÇÃO DOS 10 MÓDULOS ---
+    # --- SUB-ABA 1: REGRAS GERAIS & ANTI-SLEEP ---
     with sub_rules:
         cfg = bot.config
         with st.form("full_bot_config_form"):
-            st.markdown("#### 🔧 Motor & Canais de Notificação")
+            st.markdown("#### 🛡️ Anti-Sleep Cloud, Motor & Notificações")
+            as_c1, as_c2 = st.columns([2.2, 1])
+            in_app_url = as_c1.text_input(
+                "URL Público da App (para Anti-Sleep automático)",
+                value=cfg["app_url"],
+                placeholder="https://o-teu-app.streamlit.app",
+                help="Cola aqui o link da tua app no Streamlit Cloud (ou define APP_URL nos Secrets). O bot envia um ping a cada 4 min para nunca adormecer.",
+            )
+            in_as_on = as_c2.checkbox(
+                "Ativar Auto-Ping Anti-Sleep",
+                value=bool(cfg["anti_sleep_enabled"]),
+                help="Mantém o servidor acordado 24/7.",
+            )
+
             m_c1, m_c2, m_c3 = st.columns(3)
-            in_interval = m_c1.number_input(
-                "Intervalo entre ciclos (min)",
-                min_value=2,
-                max_value=1440,
-                value=int(cfg["interval_minutes"]),
-                help="Frequência com que o bot verifica vendas, tráfego e regras (recomendado: 15 min).",
-            )
-            in_max_act = m_c2.number_input(
-                "Máx. alterações por ciclo",
-                min_value=1,
-                max_value=20,
-                value=int(cfg["max_actions_per_cycle"]),
-                help="Limite de segurança para evitar alterar demasiados modelos de uma só vez.",
-            )
-            in_dry = m_c3.checkbox(
-                "Modo Simulação (Dry-Run)",
-                value=bool(cfg["dry_run"]),
-                help="Quando ativo, o bot testa todas as regras e escreve nos logs o que faria, sem alterar nada na loja.",
-            )
+            in_interval = m_c1.number_input("Intervalo entre ciclos (min)", min_value=2, max_value=1440, value=int(cfg["interval_minutes"]))
+            in_max_act = m_c2.number_input("Máx. alterações por ciclo", min_value=1, max_value=20, value=int(cfg["max_actions_per_cycle"]))
+            in_dry = m_c3.checkbox("Modo Simulação (Dry-Run)", value=bool(cfg["dry_run"]), help="Testa regras nos logs sem alterar a loja.")
 
             n_c1, n_c2, n_c3 = st.columns(3)
-            in_tg_tok = n_c1.text_input(
-                "Telegram Bot Token",
-                value=cfg["tg_token"],
-                type="password",
-                help="Token HTTP obtido no @BotFather do Telegram.",
-            )
-            in_tg_chat = n_c2.text_input(
-                "Telegram Chat ID",
-                value=cfg["tg_chat_id"],
-                help="O teu ID numérico do Telegram (obtido no @userinfobot).",
-            )
-            in_disc = n_c3.text_input(
-                "Discord Webhook URL",
-                value=cfg["discord_webhook"],
-                type="password",
-                help="URL opcional de webhook de um canal do Discord para receber alertas.",
-            )
+            in_tg_tok = n_c1.text_input("Telegram Bot Token", value=cfg["tg_token"], type="password")
+            in_tg_chat = n_c2.text_input("Telegram Chat ID", value=cfg["tg_chat_id"])
+            in_disc = n_c3.text_input("Discord Webhook URL", value=cfg["discord_webhook"], type="password")
 
             st.divider()
-            st.markdown("#### 1️⃣ Vigilante de Vendas, Marcos & Picos de Tráfego")
-            s_c1, s_c2, s_c3, s_c4 = st.columns([1, 1, 1, 1])
-            in_r_sales = s_c1.checkbox(
-                "1. Alertar Vendas",
-                value=bool(cfg["rule_sales_alert"]),
-                help="Envia recibo imediato no Telegram/Discord sempre que ocorre uma venda.",
-            )
-            in_r_mile = s_c2.checkbox(
-                "2. Celebrar Marcos",
-                value=bool(cfg["rule_milestone_alert"]),
-                help="Notifica quando uma peça atinge 5, 10, 25, 50 ou 100 vendas.",
-            )
-            in_r_spike = s_c3.checkbox(
-                "3. Picos de Tráfego",
-                value=bool(cfg["rule_spike_alert"]),
-                help="Avisa quando um modelo ganha muitas views num único ciclo.",
-            )
-            in_spike_val = s_c4.number_input(
-                "Salto mín. views",
-                min_value=5,
-                max_value=5000,
-                value=int(cfg["spike_views_threshold"]),
-                help="Número mínimo de novas visualizações entre ciclos para disparar alerta.",
-            )
+            st.markdown("#### 1️⃣ Vendas, Kit Social & Assistente Pós-Venda")
+            s_c1, s_c2, s_c3, s_c4 = st.columns(4)
+            in_r_sales = s_c1.checkbox("Alertar Vendas", value=bool(cfg["rule_sales_alert"]))
+            in_r_postsale = s_c2.checkbox("Script Pós-Venda", value=bool(cfg["rule_post_sale_script"]), help="Inclui mensagem pronta para pedir Make ao comprador.")
+            in_r_social = s_c3.checkbox("Kit Social (Reddit/IG)", value=bool(cfg["rule_social_kit"]), help="Envia post pronto a colar ao publicar ou lançar promo.")
+            in_r_mile = s_c4.checkbox("Celebrar Marcos", value=bool(cfg["rule_milestone_alert"]))
 
             st.divider()
-            st.markdown("#### 4️⃣ Auto-Promo (0 Vendas) & 5️⃣ Reativação de Peças Paradas")
+            st.markdown("#### 2️⃣ Vitrine Dinâmica de Cross-Selling & SEO")
+            v_c1, v_c2, v_c3 = st.columns([1.3, 0.8, 1.9])
+            in_r_show = v_c1.checkbox(
+                "Ativar Vitrine Dinâmica",
+                value=bool(cfg["rule_dynamic_showcase"]),
+                help="Injeta automaticamente os links dos teus Top Modelos na descrição dos restantes anúncios.",
+            )
+            in_show_n = v_c2.number_input("Nº Top Modelos", min_value=1, max_value=5, value=int(cfg["showcase_top_n"]))
+            in_show_title = v_c3.text_input("Título da Vitrine", value=cfg["showcase_title"])
+
+            in_r_seo = st.checkbox("Ativar Otimizador SEO & Rodapé Fixo", value=bool(cfg["rule_seo_optimizer"]))
+            seo_c1, seo_c2 = st.columns(2)
+            in_seo_marker = seo_c1.text_input("Marcador único rodapé", value=cfg["seo_footer_marker"])
+            in_seo_tags = seo_c2.text_input("Tags obrigatórias (vírgula)", value=cfg["seo_required_tags"])
+            in_seo_footer = st.text_area("Texto de rodapé", value=cfg["seo_footer_text"], height=70)
+
+            st.divider()
+            st.markdown("#### 3️⃣ Promoções Automáticas & Preço Dinâmico")
             p_c1, p_c2, p_c3, p_c4, p_c5 = st.columns([1.2, 1, 1, 1, 1])
-            in_r_promo = p_c1.checkbox(
-                "4. Auto-Promo (0 Vendas)",
-                value=bool(cfg["rule_auto_promo"]),
-                help="Aplica desconto automático em modelos com muitas views mas ainda sem nenhuma venda.",
-            )
-            in_p_views = p_c2.number_input("Mín. Views", min_value=10, max_value=50000, value=int(cfg["promo_min_views"]), help="Views mínimas antes de lançar desconto.")
-            in_p_pct = p_c3.number_input("Desconto (%)", min_value=5, max_value=90, value=int(cfg["promo_discount_pct"]), help="Percentagem de desconto a aplicar.")
-            in_p_days = p_c4.number_input("Duração (dias)", min_value=1, max_value=30, value=int(cfg["promo_days"]), help="Duração da campanha promocional.")
-            in_p_cd = p_c5.number_input("Cooldown (dias)", min_value=1, max_value=90, value=int(cfg["promo_cooldown_days"]), help="Dias de pausa obrigatória antes de voltar a promover a mesma peça.")
+            in_r_promo = p_c1.checkbox("Auto-Promo (0 Vendas)", value=bool(cfg["rule_auto_promo"]))
+            in_p_views = p_c2.number_input("Mín. Views", min_value=10, max_value=50000, value=int(cfg["promo_min_views"]))
+            in_p_pct = p_c3.number_input("Desconto (%)", min_value=5, max_value=90, value=int(cfg["promo_discount_pct"]))
+            in_p_days = p_c4.number_input("Duração (dias)", min_value=1, max_value=30, value=int(cfg["promo_days"]))
+            in_p_cd = p_c5.number_input("Cooldown (dias)", min_value=1, max_value=90, value=int(cfg["promo_cooldown_days"]))
 
             st_c1, st_c2, st_c3, st_c4 = st.columns([1.3, 1, 1, 1])
-            in_r_stag = st_c1.checkbox(
-                "5. Reativar Estagnados",
-                value=bool(cfg["rule_stagnant_revival"]),
-                help="Lança promoção relâmpago em modelos que já venderam antes mas estão há X dias sem vendas.",
-            )
-            in_stag_days = st_c2.number_input("Dias sem vender", min_value=7, max_value=365, value=int(cfg["stagnant_days"]), help="Dias desde a última venda para considerar estagnado.")
-            in_stag_pct = st_c3.number_input("Desconto Reativação (%)", min_value=5, max_value=90, value=int(cfg["stagnant_discount_pct"]), help="Desconto para reativar a peça.")
-            in_stag_pdays = st_c4.number_input("Duração Promo (dias)", min_value=1, max_value=14, value=int(cfg["stagnant_promo_days"]), help="Dias de duração do desconto.")
+            in_r_stag = st_c1.checkbox("Reativar Estagnados", value=bool(cfg["rule_stagnant_revival"]))
+            in_stag_days = st_c2.number_input("Dias sem vender", min_value=7, max_value=365, value=int(cfg["stagnant_days"]))
+            in_stag_pct = st_c3.number_input("Desconto (%)", min_value=5, max_value=90, value=int(cfg["stagnant_discount_pct"]))
+            in_stag_pdays = st_c4.number_input("Promo (dias)", min_value=1, max_value=14, value=int(cfg["stagnant_promo_days"]))
 
-            st.divider()
-            st.markdown("#### 6️⃣ Preço Dinâmico & 7️⃣ Promoção Relâmpago de Fim de Semana")
             d_c1, d_c2, d_c3, d_c4 = st.columns([1.2, 1, 1, 1])
-            in_r_price = d_c1.checkbox(
-                "6. Preço Dinâmico",
-                value=bool(cfg["rule_dynamic_price"]),
-                help="Sobe automaticamente o preço base à medida que o modelo acumula vendas.",
-            )
-            in_d_step = d_c2.number_input("A cada X vendas", min_value=1, max_value=500, value=int(cfg["price_step_sales"]), help="Patamar de vendas para cada subida de preço.")
-            in_d_pct = d_c3.number_input("Subida (%)", min_value=5.0, max_value=100.0, value=float(cfg["price_bump_pct"]), step=5.0, help="Percentagem de aumento em cada patamar.")
-            in_d_cap = d_c4.number_input(f"Teto Máx ({currency})", min_value=1.0, max_value=500.0, value=float(cfg["price_max_cap"]), step=1.0, help="Preço máximo que o bot nunca ultrapassará.")
+            in_r_price = d_c1.checkbox("Preço Dinâmico", value=bool(cfg["rule_dynamic_price"]))
+            in_d_step = d_c2.number_input("A cada X vendas", min_value=1, max_value=500, value=int(cfg["price_step_sales"]))
+            in_d_pct = d_c3.number_input("Subida (%)", min_value=5.0, max_value=100.0, value=float(cfg["price_bump_pct"]), step=5.0)
+            in_d_cap = d_c4.number_input(f"Teto Máx ({currency})", min_value=1.0, max_value=500.0, value=float(cfg["price_max_cap"]), step=1.0)
 
             w_c1, w_c2, w_c3, w_c4 = st.columns([1.3, 1, 1, 1])
-            in_r_wk = w_c1.checkbox(
-                "7. Flash Fim-de-Semana",
-                value=bool(cfg["rule_weekend_flash"]),
-                help="Aplica automaticamente um desconto de fim de semana todas as semanas no dia/hora escolhidos.",
-            )
+            in_r_wk = w_c1.checkbox("Flash Fim-de-Semana", value=bool(cfg["rule_weekend_flash"]))
             dias_opt = ["Segunda", "Terça", "Quarta", "Quinta", "Sexta", "Sábado", "Domingo"]
-            in_wk_day = w_c2.selectbox("Dia de início", dias_opt, index=int(cfg["weekend_day"]), help="Dia da semana em que arranca a campanha.")
-            in_wk_hr = w_c3.number_input("Hora início (0-23)", min_value=0, max_value=23, value=int(cfg["weekend_hour"]), help="Hora local para ativar o desconto.")
-            in_wk_pct = w_c4.number_input("Desconto Flash (%)", min_value=5, max_value=80, value=int(cfg["weekend_discount_pct"]), help="Percentagem de desconto do fim de semana.")
+            in_wk_day = w_c2.selectbox("Dia início", dias_opt, index=int(cfg["weekend_day"]))
+            in_wk_hr = w_c3.number_input("Hora (0-23)", min_value=0, max_value=23, value=int(cfg["weekend_hour"]))
+            in_wk_pct = w_c4.number_input("Desconto Flash (%)", min_value=5, max_value=80, value=int(cfg["weekend_discount_pct"]))
 
             st.divider()
-            st.markdown("#### 8️⃣ Otimizador SEO & Rodapé")
-            in_r_seo = st.checkbox(
-                "8. Garantir Rodapé & Tags Base em Todos os Modelos",
-                value=bool(cfg["rule_seo_optimizer"]),
-                help="Adiciona automaticamente o teu rodapé de marca/licença e tags obrigatórias às peças que ainda não os têm.",
-            )
-            seo_c1, seo_c2 = st.columns(2)
-            in_seo_marker = seo_c1.text_input("Marcador único", value=cfg["seo_footer_marker"], help="Texto usado para verificar se o rodapé já existe na descrição.")
-            in_seo_tags = seo_c2.text_input("Tags obrigatórias (vírgula)", value=cfg["seo_required_tags"], help="Tags que o bot garante em todas as peças.")
-            in_seo_footer = st.text_area("Texto de rodapé a anexar", value=cfg["seo_footer_text"], height=80, help="Texto adicionado ao final da descrição.")
+            st.markdown("#### 4️⃣ Picos de Tráfego, Radar & Relatórios")
+            sp_c1, sp_c2, rk_c1, rk_c2 = st.columns([1, 0.8, 1, 1.8])
+            in_r_spike = sp_c1.checkbox("Picos Views", value=bool(cfg["rule_spike_alert"]))
+            in_spike_val = sp_c2.number_input("Salto mín.", min_value=5, max_value=5000, value=int(cfg["spike_views_threshold"]))
+            in_r_mkt = rk_c1.checkbox("Radar Nichos", value=bool(cfg["rule_market_watch"]))
+            in_kw = rk_c2.text_input("Keywords vigiadas (máx 4)", value=cfg["watch_keywords"], placeholder="seat leon, gauge pod")
 
-            st.divider()
-            st.markdown("#### 9️⃣ Radar de Nichos & 🔟 Relatórios Automáticos")
-            rk_c1, rk_c2 = st.columns([1, 2.5])
-            in_r_mkt = rk_c1.checkbox(
-                "9. Radar de Nichos",
-                value=bool(cfg["rule_market_watch"]),
-                help="Vigia palavras-chave e avisa quando surgem modelos novos pagos no teu nicho.",
-            )
-            in_kw = rk_c2.text_input("Palavras-chave (máx. 4, vírgula)", value=cfg["watch_keywords"], placeholder="seat leon, gauge pod, intake", help="Termos pesquisados automaticamente a cada ciclo.")
-
-            rep_c1, rep_c2, rep_c3, rep_c4 = st.columns([1.1, 0.9, 1.1, 1.1])
-            in_r_rep = rep_c1.checkbox("10a. Relatório Diário", value=bool(cfg["rule_daily_report"]), help="Envia resumo diário de vendas e novas views no Telegram/Discord.")
-            in_rep_hr = rep_c2.number_input("Hora envio (0-23)", min_value=0, max_value=23, value=int(cfg["daily_report_hour"]), help="Hora local para envio do relatório diário.")
-            in_r_wk_rep = rep_c3.checkbox("10b. Resumo Semanal", value=bool(cfg["rule_weekly_report"]), help="Envia resumo semanal aos domingos às 20h.")
-            in_r_queue = rep_c4.checkbox("Fila Publicação", value=bool(cfg["rule_queue_publisher"]), help="Publica automaticamente modelos agendados na fila.")
+            rep_c1, rep_c2, rep_c3, rep_c4 = st.columns(4)
+            in_r_rep = rep_c1.checkbox("Relatório Diário", value=bool(cfg["rule_daily_report"]))
+            in_rep_hr = rep_c2.number_input("Hora envio", min_value=0, max_value=23, value=int(cfg["daily_report_hour"]))
+            in_r_wk_rep = rep_c3.checkbox("Resumo Semanal", value=bool(cfg["rule_weekly_report"]))
+            in_r_queue = rep_c4.checkbox("Fila Publicação", value=bool(cfg["rule_queue_publisher"]))
 
             save_all_btn = st.form_submit_button("💾 Guardar Toda a Configuração", type="primary", use_container_width=True)
 
         if save_all_btn:
             with bot._lock:
                 bot.config.update({
+                    "app_url": in_app_url.strip(),
+                    "anti_sleep_enabled": bool(in_as_on),
                     "interval_minutes": int(in_interval),
                     "max_actions_per_cycle": int(in_max_act),
                     "dry_run": bool(in_dry),
@@ -2341,9 +2473,16 @@ with tab_bot:
                     "tg_chat_id": in_tg_chat.strip(),
                     "discord_webhook": in_disc.strip(),
                     "rule_sales_alert": bool(in_r_sales),
+                    "rule_post_sale_script": bool(in_r_postsale),
+                    "rule_social_kit": bool(in_r_social),
                     "rule_milestone_alert": bool(in_r_mile),
-                    "rule_spike_alert": bool(in_r_spike),
-                    "spike_views_threshold": int(in_spike_val),
+                    "rule_dynamic_showcase": bool(in_r_show),
+                    "showcase_top_n": int(in_show_n),
+                    "showcase_title": in_show_title.strip(),
+                    "rule_seo_optimizer": bool(in_r_seo),
+                    "seo_footer_marker": in_seo_marker.strip(),
+                    "seo_required_tags": in_seo_tags.strip(),
+                    "seo_footer_text": in_seo_footer,
                     "rule_auto_promo": bool(in_r_promo),
                     "promo_min_views": int(in_p_views),
                     "promo_discount_pct": int(in_p_pct),
@@ -2361,10 +2500,8 @@ with tab_bot:
                     "weekend_day": dias_opt.index(in_wk_day),
                     "weekend_hour": int(in_wk_hr),
                     "weekend_discount_pct": int(in_wk_pct),
-                    "rule_seo_optimizer": bool(in_r_seo),
-                    "seo_footer_marker": in_seo_marker.strip(),
-                    "seo_required_tags": in_seo_tags.strip(),
-                    "seo_footer_text": in_seo_footer,
+                    "rule_spike_alert": bool(in_r_spike),
+                    "spike_views_threshold": int(in_spike_val),
                     "rule_market_watch": bool(in_r_mkt),
                     "watch_keywords": in_kw.strip(),
                     "rule_daily_report": bool(in_r_rep),
@@ -2372,102 +2509,186 @@ with tab_bot:
                     "rule_weekly_report": bool(in_r_wk_rep),
                     "rule_queue_publisher": bool(in_r_queue),
                 })
-            bot.log("CONFIG", "Configuração completa do bot guardada.")
-            st.success("Configuração guardada com sucesso!")
+            bot.ping_keep_alive()
+            bot.log("CONFIG", "Configuração guardada com sucesso.")
+            st.success("Configuração guardada!")
 
-        c_t1, c_t2 = st.columns(2)
-        if c_t1.button("🔔 Enviar Notificação de Teste", use_container_width=True, help="Envia uma mensagem imediata para confirmar que o Telegram/Discord está ligado."):
-            bot.send_notification("✅ <b>Cults3D Studio Pro:</b> Ligação Telegram/Discord operacional!")
+        c_t1, c_t2, c_t3 = st.columns(3)
+        if c_t1.button("🔔 Testar Telegram/Discord", use_container_width=True):
+            bot.send_notification("✅ <b>Cults3D Studio Pro v4:</b> Notificações operacionais!")
             st.toast("Notificação enviada!")
-        if c_t2.button("🧹 Limpar Cooldowns de Promoção", use_container_width=True, help="Permite que o bot volte a avaliar modelos que estavam em pausa promocional."):
+        if c_t2.button("🛡️ Testar Ping Anti-Sleep", use_container_width=True):
+            bot.ping_keep_alive()
+            st.toast(f"Anti-Sleep: {bot.keepalive_status}")
+            st.rerun()
+        if c_t3.button("🧹 Limpar Cooldowns Promo", use_container_width=True):
             with bot._lock:
                 bot.promo_cooldowns = {}
             bot._save_state()
             st.toast("Cooldowns limpos!")
 
-    # --- SUB-ABA 2: COMANDOS REMOTOS VIA TELEGRAM ---
+    # --- SUB-ABA 2: EARLY-BIRD & TESTES A/B POR RPM ---
+    with sub_growth:
+        if df_creations.empty:
+            st.info("Carrega primeiro os teus modelos para configurar campanhas Early-Bird ou Testes A/B.")
+        else:
+            model_options = {f"{r['nome']} (atual: {r['preco']:.2f} {currency})": r for _, r in df_creations.iterrows()}
+            g_col1, g_col2 = st.columns(2)
+
+            # Coluna 1: Early-Bird
+            with g_col1:
+                st.markdown("#### 🐣 Preço Early-Bird de Lançamento")
+                st.caption("Define um preço baixo para as primeiras X vendas ganharem tração no algoritmo; sobe automaticamente depois.")
+                with st.form("eb_form"):
+                    eb_model_lbl = st.selectbox("Modelo alvo", list(model_options.keys()), key="eb_sel")
+                    eb_launch = st.number_input(f"Preço Lançamento ({currency})", min_value=0.5, step=0.5, value=1.99)
+                    eb_regular = st.number_input(f"Preço Normal Final ({currency})", min_value=1.0, step=0.5, value=3.99)
+                    eb_sales = st.number_input("Subir após quantas vendas?", min_value=1, max_value=50, value=3)
+                    if st.form_submit_button("➕ Ativar Regra Early-Bird", type="primary", use_container_width=True):
+                        m_obj = model_options[eb_model_lbl]
+                        with bot._lock:
+                            bot.early_bird_rules[m_obj["id"]] = {
+                                "name": m_obj["nome"],
+                                "launch_price": float(eb_launch),
+                                "regular_price": float(eb_regular),
+                                "target_sales": int(eb_sales),
+                                "completed": False,
+                            }
+                        bot._save_state()
+                        st.success(f"Early-Bird ativo para '{m_obj['nome']}'!")
+                        st.rerun()
+
+                if bot.early_bird_rules:
+                    st.dataframe(
+                        pd.DataFrame([
+                            {
+                                "Modelo": v["name"],
+                                "Lançamento": v["launch_price"],
+                                "Final": v["regular_price"],
+                                "Meta Vendas": v["target_sales"],
+                                "Estado": "Concluído" if v.get("completed") else "Ativo",
+                            }
+                            for v in bot.early_bird_rules.values()
+                        ]),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
+            # Coluna 2: Teste A/B por RPM
+            with g_col2:
+                st.markdown("#### 🧪 Teste A/B de Preço por RPM")
+                st.caption("Testa Preço A vs Preço B durante X dias cada e aplica automaticamente o que gerar maior lucro por 1.000 views.")
+                with st.form("ab_form"):
+                    ab_model_lbl = st.selectbox("Modelo a testar", list(model_options.keys()), key="ab_sel")
+                    ab_pa = st.number_input(f"Preço A ({currency})", min_value=0.5, step=0.5, value=2.50)
+                    ab_pb = st.number_input(f"Preço B ({currency})", min_value=0.5, step=0.5, value=4.00)
+                    ab_days = st.number_input("Dias por cada preço", min_value=2, max_value=30, value=7)
+                    if st.form_submit_button("🧪 Iniciar Teste A/B", type="primary", use_container_width=True):
+                        m_obj = model_options[ab_model_lbl]
+                        cur_rev = float(df_sales[df_sales["creation_id"] == m_obj["id"]]["receita_liquida"].sum()) if not df_sales.empty else 0.0
+                        with bot._lock:
+                            bot.ab_tests[m_obj["id"]] = {
+                                "name": m_obj["nome"],
+                                "price_a": float(ab_pa),
+                                "price_b": float(ab_pb),
+                                "days_per_phase": int(ab_days),
+                                "phase": "A",
+                                "phase_start": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                                "start_views": int(m_obj["views"]),
+                                "start_rev": cur_rev,
+                                "rpm_a": 0.0,
+                                "rpm_b": 0.0,
+                                "winner_price": 0.0,
+                            }
+                        bot._save_state()
+                        st.success(f"Teste A/B iniciado para '{m_obj['nome']}'!")
+                        st.rerun()
+
+                if bot.ab_tests:
+                    st.dataframe(
+                        pd.DataFrame([
+                            {
+                                "Modelo": v["name"],
+                                "Fase": v["phase"],
+                                "Preço A": v["price_a"],
+                                "Preço B": v["price_b"],
+                                "RPM A": v.get("rpm_a", 0),
+                                "RPM B": v.get("rpm_b", 0),
+                                "Vencedor": v.get("winner_price") or "-",
+                            }
+                            for v in bot.ab_tests.values()
+                        ]),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
+    # --- SUB-ABA 3: COMANDOS REMOTOS TELEGRAM ---
     with sub_tg:
-        st.markdown("#### 📱 Controla a Tua Loja por Mensagem no Telegram")
-        st.write(
-            "Quando o bot está ativo no PC, podes enviar comandos diretamente no chat com o teu bot do Telegram (apenas o teu `Chat ID` tem permissão para executar comandos):"
-        )
+        st.markdown("#### 📱 Comandos Remotos via Telegram")
         st.markdown(
             """
-            - `/status` — Mostra se o bot está ativo, modo (Simulação/Real), último ciclo e quota diária da API.
-            - `/vendas` — Devolve as últimas 5 vendas com valor líquido e comprador.
-            - `/top` — Lista os teus 5 modelos mais vistos e respetivos downloads.
-            - `/ciclo` — Força a execução imediata de um ciclo completo de verificação.
-            - `/pausar` — Pausa o bot remotamente a partir do telemóvel.
-            - `/retomar` — Volta a ligar o bot remotamente.
+            - `/status` — Estado do bot, Anti-Sleep, último ciclo e quota da API.
+            - `/vendas` — Últimas 5 vendas com receita líquida e comprador.
+            - `/top` — Top 5 modelos mais vistos e downloads.
+            - `/kit` — Gera um post pronto a copiar/colar para o teu modelo mais visto.
+            - `/ciclo` — Força um ciclo completo imediato.
+            - `/pausar` e `/retomar` — Pausa ou volta a ligar o bot pelo telemóvel.
             """
         )
-        if st.button("📡 Verificar Comandos Pendentes Agora", help="Lê imediatamente as últimas mensagens enviadas ao bot no Telegram."):
+        if st.button("📡 Ler Comandos Pendentes Agora"):
             bot.poll_telegram_commands()
-            st.toast("Verificação de comandos concluída!")
+            st.toast("Comandos verificados!")
 
-    # --- SUB-ABA 3: FILA DE PUBLICAÇÃO AGENDADA ---
+    # --- SUB-ABA 4: FILA DE PUBLICAÇÃO ---
     with sub_queue:
-        st.markdown("#### 🗓️ Fila de Publicação Automática (Drip-Feed)")
+        st.markdown("#### 🗓️ Fila de Publicação Agendada")
         if bot.publish_queue:
-            q_df = pd.DataFrame([
-                {
-                    "ID": x["queue_id"],
-                    "Modelo": x["name"],
-                    "Preço": x["price"],
-                    "Agendado (UTC)": x["scheduled_at"],
-                    "Estado": x["status"],
-                }
-                for x in bot.publish_queue
-            ])
-            st.dataframe(q_df, use_container_width=True, hide_index=True)
-
-            if st.button("🗑️ Limpar Itens Já Publicados / Com Erro", help="Remove da lista os modelos que já foram publicados."):
+            st.dataframe(
+                pd.DataFrame([
+                    {"Modelo": x["name"], "Preço": x["price"], "Agendado (UTC)": x["scheduled_at"], "Estado": x["status"]}
+                    for x in bot.publish_queue
+                ]),
+                use_container_width=True,
+                hide_index=True,
+            )
+            if st.button("🗑️ Limpar Concluídos"):
                 with bot._lock:
                     bot.publish_queue = [x for x in bot.publish_queue if x.get("status") == "Pendente"]
                 bot._save_state()
                 st.rerun()
         else:
-            st.info("A fila está vazia. Usa a aba **🚀 Estúdio Publicação & SEO** e clica em **Agendar na Fila do Bot**.")
+            st.info("Fila vazia. Agenda modelos na aba **🚀 Estúdio Publicação & SEO**.")
 
-    # --- SUB-ABA 4: HISTÓRICO & ROLLBACK ---
+    # --- SUB-ABA 5: ROLLBACK ---
     with sub_rollback:
-        st.markdown("#### ↩️ Auditoria de Alterações & Reversão")
+        st.markdown("#### ↩️ Histórico & Desfazer Alterações")
         with bot._lock:
             hist_items = list(bot.action_history)
-
         if not hist_items:
-            st.info("O bot ainda não executou alterações reais na conta.")
+            st.info("Sem alterações registadas.")
         else:
-            h_df = pd.DataFrame([
-                {
-                    "Hora": h["hora"],
-                    "Tipo": h["tipo"],
-                    "Modelo": h["modelo"],
-                    "Detalhe": h["detalhe"],
-                    "Revertido": "Sim" if h.get("reverted") else "Não",
-                }
-                for h in hist_items
-            ])
-            st.dataframe(h_df, use_container_width=True, hide_index=True)
-
+            st.dataframe(
+                pd.DataFrame([
+                    {"Hora": h["hora"], "Tipo": h["tipo"], "Modelo": h["modelo"], "Detalhe": h["detalhe"], "Revertido": "Sim" if h.get("reverted") else "Não"}
+                    for h in hist_items
+                ]),
+                use_container_width=True,
+                hide_index=True,
+            )
             reversible_list = [h for h in hist_items if h.get("reversible") and not h.get("reverted")]
             if reversible_list:
-                rev_map = {
-                    f"[{h['hora']}] {h['tipo']} — {h['modelo']} ({h['detalhe']})": h["action_id"]
-                    for h in reversible_list
-                }
-                sel_rev = st.selectbox("Selecionar ação para desfazer", list(rev_map.keys()))
-                if st.button("↩️ Desfazer Alteração Selecionada", type="primary"):
+                rev_map = {f"[{h['hora']}] {h['tipo']} — {h['modelo']} ({h['detalhe']})": h["action_id"] for h in reversible_list}
+                sel_rev = st.selectbox("Selecionar alteração para desfazer", list(rev_map.keys()))
+                if st.button("↩️ Desfazer Agora", type="primary"):
                     try:
-                        msg = bot.revert_action(rev_map[sel_rev])
-                        st.success(msg)
+                        st.success(bot.revert_action(rev_map[sel_rev]))
                         st.rerun()
                     except Exception as e:
                         st.error(str(e))
 
-    # --- SUB-ABA 5: LOGS ---
+    # --- SUB-ABA 6: LOGS ---
     with sub_logs:
-        l1, l2 = st.columns([1, 1])
+        l1, l2 = st.columns(2)
         if l1.button("🔄 Atualizar Logs", use_container_width=True):
             st.rerun()
         if l2.button("🧹 Limpar Logs", use_container_width=True):
@@ -2475,32 +2696,27 @@ with tab_bot:
                 bot.logs = []
             bot._save_state()
             st.rerun()
-
         with bot._lock:
             current_logs = list(bot.logs)
-
         if current_logs:
             st.dataframe(pd.DataFrame(current_logs), use_container_width=True, hide_index=True)
         else:
-            st.info("Sem registos nos logs.")
+            st.info("Sem logs.")
 
 
 # ==============================================================================
-# ABA 3: ESTÚDIO DE PUBLICAÇÃO & SEO (GAMAS, TEMPLATES & SCORE)
+# ABA 3: ESTÚDIO DE PUBLICAÇÃO & SEO (PRESETS, FAQ ANTI-DÚVIDAS & HORA DE OURO)
 # ==============================================================================
 with tab_publish:
     st.subheader("🚀 Estúdio Profissional de Publicação & SEO")
-    st.caption("Usa Presets de Gama para preencher definições de impressão e licença em 1 clique, valida o SEO Score e publica agora ou agenda.")
 
-    # Gestor de Presets / Gamas
     with bot._lock:
         presets_dict = dict(bot.presets)
 
-    pr_c1, pr_c2 = st.columns([2, 1])
-    selected_preset_name = pr_c1.selectbox(
+    selected_preset_name = st.selectbox(
         "Selecionar Gama / Template de Produto",
         ["(Personalizado / Em branco)"] + list(presets_dict.keys()),
-        help="Carrega automaticamente definições de impressão, preço sugerido, licença e tags base para a gama escolhida.",
+        help="Preenche automaticamente parâmetros de impressão, FAQ anti-dúvidas, preço e tags.",
     )
     active_preset = presets_dict.get(selected_preset_name, {})
 
@@ -2510,11 +2726,7 @@ with tab_publish:
     col_form, col_preview = st.columns([1.4, 1])
 
     with col_form:
-        p_name = st.text_input(
-            "Título do Modelo *",
-            placeholder="Ex: Seat Leon Mk2 (1P) - 52mm Air Vent Turbo Gauge Pod",
-            help="Inclui modelo exato, dimensões e função principal para captar pesquisas exatas.",
-        )
+        p_name = st.text_input("Título do Modelo *", placeholder="Ex: Seat Leon Mk2 (1P) - 52mm Air Vent Turbo Gauge Pod")
 
         c1, c2, c3 = st.columns(3)
         if cat_map:
@@ -2525,80 +2737,31 @@ with tab_publish:
                     if hint in lbl_c.lower():
                         default_cat_idx = idx_c
                         break
-            selected_cat_label = c1.selectbox(
-                "Categoria *",
-                list(cat_map.keys()),
-                index=default_cat_idx,
-                help="Categoria oficial do Cults3D onde o modelo será listado.",
-            )
+            selected_cat_label = c1.selectbox("Categoria *", list(cat_map.keys()), index=default_cat_idx)
             p_cat_id = cat_map[selected_cat_label]
         else:
-            p_cat_id = c1.text_input("ID da Categoria *", placeholder="ID numérico")
+            p_cat_id = c1.text_input("ID da Categoria *")
 
-        p_price = c2.number_input(
-            f"Preço ({currency})",
-            min_value=0.0,
-            step=0.5,
-            value=float(active_preset.get("price", 2.50)),
-            help="Define 0.00 para modelo gratuito.",
-        )
-        p_locale = c3.selectbox(
-            "Idioma",
-            ["EN", "PT", "ES", "FR", "DE"],
-            index=0,
-            help="Idioma principal do anúncio (EN maximiza vendas internacionais).",
-        )
+        p_price = c2.number_input(f"Preço ({currency})", min_value=0.0, step=0.5, value=float(active_preset.get("price", 2.50)))
+        p_locale = c3.selectbox("Idioma", ["EN", "PT", "ES", "FR", "DE"], index=0)
 
-        st.markdown("**Construtor Estruturado de Descrição**")
-        d_overview = st.text_area(
-            "1. Resumo & Funcionalidades *",
-            value=active_preset.get("overview", ""),
-            height=80,
-            help="Explica o que a peça faz, compatibilidade e vantagens.",
-        )
-        d_settings = st.text_area(
-            "2. Definições de Impressão 3D *",
-            value=active_preset.get("print_settings", ""),
-            height=110,
-            help="Material (PETG/ABS/ASA/PLA), altura de camada, paredes, infill e suportes.",
-        )
-        d_assembly = st.text_area(
-            "3. Montagem & Hardware (opcional)",
-            value=active_preset.get("assembly", ""),
-            height=65,
-            help="Parafusos, cola, encaixes ou dicas de pós-processamento.",
-        )
-        d_license = st.text_input(
-            "4. Aviso de Licença",
-            value=active_preset.get("license", "Personal use only."),
-            help="Direitos de utilização comercial ou pessoal.",
-        )
+        d_overview = st.text_area("1. Resumo & Funcionalidades *", value=active_preset.get("overview", ""), height=75)
+        d_settings = st.text_area("2. Definições de Impressão 3D *", value=active_preset.get("print_settings", ""), height=100)
+        d_assembly = st.text_area("3. Montagem & Hardware", value=active_preset.get("assembly", ""), height=60)
+        d_faq = st.text_area("4. FAQ Anti-Dúvidas (aumenta conversão)", value=active_preset.get("faq", ""), height=65)
+        d_license = st.text_input("5. Aviso de Licença", value=active_preset.get("license", "Personal use only."))
 
-        p_tags = st.text_input(
-            "Tags SEO (separadas por vírgula) *",
-            value=active_preset.get("tags", ""),
-            help="Usa entre 8 e 15 palavras-chave separadas por vírgula.",
-        )
+        p_tags = st.text_input("Tags SEO (vírgula) *", value=active_preset.get("tags", ""))
+        p_files = st.text_area("URLs Ficheiros 3D (HTTPS, 1 por linha) *", placeholder="https://.../peca.stl", height=70)
+        p_images = st.text_area("URLs Imagens / Renders (HTTPS, 1 por linha) *", placeholder="https://.../render1.jpg", height=70)
 
-        p_files = st.text_area(
-            "URLs dos Ficheiros 3D (.stl / .3mf / .zip — 1 por linha, HTTPS) *",
-            placeholder="https://.../peca_principal.stl",
-            height=75,
-            help="Links diretos HTTPS públicos (máx. 10 ficheiros).",
-        )
-        p_images = st.text_area(
-            "URLs das Imagens / Renders (1 por linha, HTTPS) *",
-            placeholder="https://.../render1.jpg",
-            height=75,
-            help="Links diretos HTTPS das fotos/renders (máx. 10 imagens; a primeira será a capa).",
-        )
-
-    # Montar descrição final estruturada e calcular SEO em tempo real
     sections = [d_overview.strip()]
     if d_settings.strip():
         sections.append(f"### Print Settings\n{d_settings.strip()}")
     if d_assembly.strip():
-        sections.append(f"### Assembly & Notes\n{d_assembly.strip()}")
+        sections.append(f"### Assembly & Hardware\n{d_assembly.strip()}")
+    if d_faq.strip():
+        sections.append(f"### FAQ & Fitment Notes\n{d_faq.strip()}")
     if d_license.strip():
         sections.append(f"### License\n{d_license.strip()}")
     full_description = "\n\n".join(s for s in sections if s)
@@ -2607,28 +2770,17 @@ with tab_publish:
     seo_report = analyze_listing_seo(p_name, full_description, tag_list, p_price)
 
     with col_preview:
-        st.markdown("#### 🎯 Diagnóstico SEO em Tempo Real")
-        score_val = seo_report["score"]
-        st.progress(score_val / 100.0, text=f"Qualidade SEO do Anúncio: {score_val}/100")
-
+        st.markdown("#### 🎯 Diagnóstico SEO")
+        st.progress(seo_report["score"] / 100.0, text=f"Qualidade SEO: {seo_report['score']}/100")
         if seo_report["suggested_tags"]:
-            st.info(
-                "**Tags sugeridas a partir do título:** `"
-                + ", ".join(seo_report["suggested_tags"])
-                + "`"
-            )
+            st.info("**Tags extraídas do título:** `" + ", ".join(seo_report["suggested_tags"]) + "`")
+        for tip in seo_report["tips"]:
+            st.caption(f"⚠️ {tip}")
 
-        if seo_report["tips"]:
-            for tip in seo_report["tips"]:
-                st.caption(f"⚠️ {tip}")
-        else:
-            st.success("✅ Anúncio otimizado para máxima conversão e pesquisa!")
-
-        st.markdown("#### 👁️ Pré-visualização da Descrição")
+        st.markdown("#### 👁️ Pré-visualização")
         st.markdown(f"<div class='seo-card'>{full_description.replace(chr(10), '<br>')}</div>", unsafe_allow_html=True)
 
-        # Guardar novo preset de gama
-        with st.expander("💾 Guardar como Nova Gama / Template"):
+        with st.expander("💾 Guardar como Nova Gama"):
             new_preset_title = st.text_input("Nome da Gama", placeholder="Ex: Peças Seat Leon Mk2")
             if st.button("Guardar Preset", use_container_width=True):
                 if new_preset_title.strip():
@@ -2641,34 +2793,34 @@ with tab_publish:
                             "overview": d_overview,
                             "print_settings": d_settings,
                             "assembly": d_assembly,
+                            "faq": d_faq,
                             "license": d_license,
                         }
                     bot._save_state()
-                    st.success(f"Gama '{new_preset_title.strip()}' guardada!")
+                    st.success("Preset guardado!")
                     st.rerun()
 
     st.divider()
-    act_p1, act_p2, act_p3 = st.columns([1.2, 1, 1.2])
-    sched_hours = act_p2.number_input(
-        "Atraso para agendamento (horas)",
-        min_value=1,
-        max_value=720,
-        value=2,
-        help="Usado apenas se clicares em 'Agendar na Fila do Bot'.",
+    golden_utc = next_golden_hour_utc()
+    golden_local_str = golden_utc.astimezone().strftime("%a %d/%m às %H:%M")
+
+    act_p1, act_p2, act_p3 = st.columns([1.1, 1.2, 1.2])
+    sched_mode = act_p2.selectbox(
+        "Modo de Agendamento",
+        [f"🌟 Hora de Ouro ({golden_local_str})", "⏱️ Daqui a 2 horas", "⏱️ Daqui a 6 horas", "⏱️ Daqui a 24 horas"],
+        help="Hora de Ouro agenda automaticamente para o próximo pico de tráfego (Sexta 18h ou Domingo 15h).",
     )
 
     file_list = [u.strip() for u in p_files.splitlines() if u.strip()]
     img_list = [u.strip() for u in p_images.splitlines() if u.strip()]
 
-    if act_p1.button("🚀 Publicar Agora no Cults3D", type="primary", use_container_width=True):
+    if act_p1.button("🚀 Publicar Agora", type="primary", use_container_width=True):
         if not p_name.strip() or not full_description.strip() or not p_cat_id or not file_list or not img_list:
             st.warning("Preenche todos os campos obrigatórios (*).")
-        elif len(file_list) > 10 or len(img_list) > 10:
-            st.warning("Máximo de 10 ficheiros 3D e 10 imagens por modelo.")
         elif not all(u.startswith("https://") for u in file_list + img_list):
             st.warning("Todos os URLs têm de começar por https://")
         else:
-            with st.spinner("A enviar ficheiros e a publicar no Cults3D..."):
+            with st.spinner("A publicar no Cults3D..."):
                 try:
                     created = client.create_creation(
                         name=p_name.strip(),
@@ -2682,17 +2834,25 @@ with tab_publish:
                         locale=p_locale,
                     )
                     st.session_state.creations = client.get_all_my_creations(currency=currency)
-                    st.success(f"Modelo publicado com sucesso! Link: {created.get('url')}")
+                    st.success(f"Publicado! Link: {created.get('url')}")
                 except Exception as e:
                     st.error(str(e))
 
-    if act_p3.button("🗓️ Agendar na Fila do Bot", use_container_width=True, help="Coloca este modelo na fila do bot para ser publicado automaticamente à hora agendada."):
+    if act_p3.button("🗓️ Agendar na Fila do Bot", use_container_width=True):
         if not p_name.strip() or not full_description.strip() or not p_cat_id or not file_list or not img_list:
             st.warning("Preenche todos os campos obrigatórios (*).")
         elif not all(u.startswith("https://") for u in file_list + img_list):
             st.warning("Todos os URLs têm de começar por https://")
         else:
-            sched_dt = datetime.now(timezone.utc) + timedelta(hours=int(sched_hours))
+            if "Hora de Ouro" in sched_mode:
+                sched_dt = golden_utc
+            elif "6 horas" in sched_mode:
+                sched_dt = datetime.now(timezone.utc) + timedelta(hours=6)
+            elif "24 horas" in sched_mode:
+                sched_dt = datetime.now(timezone.utc) + timedelta(hours=24)
+            else:
+                sched_dt = datetime.now(timezone.utc) + timedelta(hours=2)
+
             with bot._lock:
                 bot.publish_queue.append({
                     "queue_id": f"q_{int(time.time() * 1000)}",
@@ -2712,325 +2872,179 @@ with tab_publish:
 
 
 # ==============================================================================
-# ABA 4: GESTÃO EM MASSA & CAMPANHAS
+# ABA 4: GESTÃO EM MASSA
 # ==============================================================================
 with tab_bulk:
     if df_creations.empty:
-        st.info("Não tens modelos carregados para editar.")
+        st.info("Não tens modelos carregados.")
     else:
-        st.subheader("⚡ Edição em Massa & Campanhas Promocionais")
-        options_map = {
-            f"{row['nome']} ({row['preco']:.2f} {currency} | {row['views']} views)": row
-            for _, row in df_creations.iterrows()
-        }
+        st.subheader("⚡ Edição em Massa")
+        options_map = {f"{r['nome']} ({r['preco']:.2f} {currency} | {r['views']} views)": r for _, r in df_creations.iterrows()}
         all_labels = list(options_map.keys())
-
-        select_all = st.checkbox("Selecionar todos os modelos", help="Marca rapidamente todo o catálogo.")
-        selected_labels = st.multiselect(
-            "Modelos selecionados",
-            all_labels,
-            default=all_labels if select_all else [],
-            help="Escolhe as peças onde queres aplicar alterações em lote.",
-        )
+        select_all = st.checkbox("Selecionar todos")
+        selected_labels = st.multiselect("Modelos alvo", all_labels, default=all_labels if select_all else [])
 
         st.divider()
         col_act1, col_act2, col_act3 = st.columns(3)
 
         with col_act1:
-            st.markdown("### 🏷️ Preços Base")
-            price_mode = st.radio(
-                "Modo de ajuste",
-                ["Ajuste Percentual (%)", "Preço Fixo Novo"],
-                help="Percentual ajusta proporcionalmente; Preço Fixo define o mesmo valor em todos.",
-            )
-            price_val = st.number_input("Valor (ex: -20 ou 4.99)", value=0.0, step=0.5, help="Usa valores negativos para reduzir preços.")
-
-            if st.button("Aplicar Preços", type="primary", use_container_width=True):
-                if not selected_labels:
-                    st.warning("Seleciona pelo menos um modelo.")
-                else:
-                    progress = st.progress(0)
-                    errors_count = 0
-                    for idx, label in enumerate(selected_labels):
-                        row = options_map[label]
-                        old_p = row["preco"]
-                        new_p = (
-                            round(old_p * (1.0 + price_val / 100.0), 2)
-                            if price_mode == "Ajuste Percentual (%)"
-                            else round(price_val, 2)
-                        )
-                        try:
-                            client.update_creation(creation_id=row["id"], price=max(0.0, new_p), currency=currency)
-                        except Exception as e:
-                            errors_count += 1
-                            st.error(f"Erro em {row['nome']}: {e}")
-                        progress.progress((idx + 1) / len(selected_labels))
-                    if errors_count == 0:
-                        st.session_state.creations = client.get_all_my_creations(currency=currency)
-                        st.success("Preços atualizados!")
-                        st.rerun()
+            st.markdown("### 🏷️ Preços")
+            price_mode = st.radio("Modo", ["Ajuste Percentual (%)", "Preço Fixo Novo"])
+            price_val = st.number_input("Valor", value=0.0, step=0.5)
+            if st.button("Aplicar Preços", type="primary", use_container_width=True) and selected_labels:
+                for label in selected_labels:
+                    row = options_map[label]
+                    new_p = round(row["preco"] * (1.0 + price_val / 100.0), 2) if price_mode == "Ajuste Percentual (%)" else round(price_val, 2)
+                    client.update_creation(creation_id=row["id"], price=max(0.0, new_p), currency=currency)
+                st.session_state.creations = client.get_all_my_creations(currency=currency)
+                st.success("Preços atualizados!")
+                st.rerun()
 
         with col_act2:
-            st.markdown("### 🔥 Campanha de Desconto")
-            disc_pct = st.slider("Desconto (%)", min_value=5, max_value=90, value=20, step=5, help="Percentagem de desconto promocional visível no site.")
-            disc_days = st.number_input("Duração (dias)", min_value=1, max_value=90, value=7, help="Número de dias até o desconto expirar automaticamente.")
-
-            if st.button("Ativar Desconto", type="primary", use_container_width=True):
-                if not selected_labels:
-                    st.warning("Seleciona pelo menos um modelo.")
-                else:
-                    end_at = (datetime.now(timezone.utc) + timedelta(days=int(disc_days))).strftime("%Y-%m-%dT%H:%M:%SZ")
-                    progress = st.progress(0)
-                    errors_count = 0
-                    for idx, label in enumerate(selected_labels):
-                        row = options_map[label]
-                        try:
-                            client.create_discount(
-                                creation_id=row["id"],
-                                percentage=disc_pct,
-                                end_at_iso=end_at,
-                            )
-                        except Exception as e:
-                            errors_count += 1
-                            st.error(f"Erro em {row['nome']}: {e}")
-                        progress.progress((idx + 1) / len(selected_labels))
-                    if errors_count == 0:
-                        st.success(f"Desconto de {disc_pct}% ativo por {int(disc_days)} dias!")
+            st.markdown("### 🔥 Descontos")
+            disc_pct = st.slider("Desconto (%)", 5, 90, 20, 5)
+            disc_days = st.number_input("Duração (dias)", 1, 90, 7)
+            if st.button("Ativar Desconto", type="primary", use_container_width=True) and selected_labels:
+                end_at = (datetime.now(timezone.utc) + timedelta(days=int(disc_days))).strftime("%Y-%m-%dT%H:%M:%SZ")
+                for label in selected_labels:
+                    client.create_discount(creation_id=options_map[label]["id"], percentage=disc_pct, end_at_iso=end_at)
+                st.success(f"Desconto de {disc_pct}% ativo!")
 
         with col_act3:
-            st.markdown("### 🔖 Tags & SEO")
-            tag_mode = st.radio(
-                "Ação nas tags",
-                ["Adicionar às existentes", "Substituir todas"],
-                help="Adicionar mantém as tags atuais e acrescenta as novas.",
-            )
-            tags_input = st.text_input("Tags (vírgula)", placeholder="ex: stl, 3d print, tuning", help="Tags separadas por vírgula.")
-
-            if st.button("Atualizar Tags", type="primary", use_container_width=True):
+            st.markdown("### 🔖 Tags SEO")
+            tag_mode = st.radio("Ação", ["Adicionar às existentes", "Substituir todas"])
+            tags_input = st.text_input("Tags (vírgula)")
+            if st.button("Atualizar Tags", type="primary", use_container_width=True) and selected_labels and tags_input.strip():
                 new_tags = [t.strip() for t in tags_input.split(",") if t.strip()]
-                if not selected_labels or not new_tags:
-                    st.warning("Seleciona modelos e escreve pelo menos uma tag.")
-                else:
-                    progress = st.progress(0)
-                    errors_count = 0
-                    for idx, label in enumerate(selected_labels):
-                        row = options_map[label]
-                        if tag_mode == "Adicionar às existentes":
-                            merged = list(dict.fromkeys(row["tags_list"] + new_tags))
-                        else:
-                            merged = new_tags
-                        try:
-                            client.update_creation(creation_id=row["id"], tags=merged)
-                        except Exception as e:
-                            errors_count += 1
-                            st.error(f"Erro em {row['nome']}: {e}")
-                        progress.progress((idx + 1) / len(selected_labels))
-                    if errors_count == 0:
-                        st.session_state.creations = client.get_all_my_creations(currency=currency)
-                        st.success("Tags atualizadas!")
-                        st.rerun()
+                for label in selected_labels:
+                    row = options_map[label]
+                    merged = list(dict.fromkeys(row["tags_list"] + new_tags)) if tag_mode == "Adicionar às existentes" else new_tags
+                    client.update_creation(creation_id=row["id"], tags=merged)
+                st.session_state.creations = client.get_all_my_creations(currency=currency)
+                st.success("Tags atualizadas!")
+                st.rerun()
 
 
 # ==============================================================================
-# ABA 5: RADAR DE MERCADO & INTELIGÊNCIA DE NICHOS (CORRIGIDO)
+# ABA 5: RADAR DE MERCADO & EXTRATOR DE N-GRAMS
 # ==============================================================================
 with tab_market:
-    st.subheader("🔍 Radar de Mercado & Inteligência de Nichos")
-    st.caption("Analisa concorrência real via `creationsSearchBatch`, estima receita por modelo, descobre preços ideais e extrai as melhores keywords.")
-
+    st.subheader("🔍 Radar de Nichos & Mineração de Keywords (N-Grams)")
     r_c1, r_c2, r_c3, r_c4 = st.columns([2.5, 1.2, 1, 1])
-    m_query = r_c1.text_input(
-        "Palavra-chave / Nicho a investigar *",
-        placeholder="Ex: seat leon, gauge pod, articulated dragon, deck box",
-        help="Termo exato pesquisado no motor de busca do Cults3D.",
-    )
-    m_price_filter = r_c2.selectbox(
-        "Tipo de Modelos",
-        ["Apenas Pagos", "Todos (Pagos + Grátis)", "Apenas Gratuitos"],
-        help="Filtra os modelos analisados por modelo de monetização.",
-    )
-    m_limit = r_c3.number_input(
-        "Amostra (modelos)",
-        min_value=10,
-        max_value=100,
-        value=40,
-        step=10,
-        help="Quantidade de resultados a recolher (usa paginação automática acima de 50).",
-    )
-    m_sort = r_c4.selectbox(
-        "Ordenar por",
-        ["Receita Estimada", "Downloads", "Likes", "Views", "Preço"],
-        help="Critério de ordenação da tabela de concorrência.",
-    )
+    m_query = r_c1.text_input("Nicho / Palavra-chave *", placeholder="Ex: seat leon, gauge pod, articulated dragon")
+    m_price_filter = r_c2.selectbox("Filtro", ["Apenas Pagos", "Todos (Pagos + Grátis)", "Apenas Gratuitos"])
+    m_limit = r_c3.number_input("Amostra", 10, 100, 40, 10)
+    m_sort = r_c4.selectbox("Ordenar por", ["Receita Estimada", "Downloads", "Likes", "Views", "Preço"])
 
-    if st.button("🔎 Analisar Nicho Agora", type="primary", help="Executa pesquisa em tempo real na API do Cults3D e calcula indicadores de oportunidade."):
-        if not m_query.strip():
-            st.warning("Escreve um termo de pesquisa.")
-        else:
-            with st.spinner(f"A investigar o nicho '{m_query.strip()}' no Cults3D..."):
-                try:
-                    only_paid_flag = m_price_filter == "Apenas Pagos"
-                    raw_search = client.search_market(
-                        search_query=m_query.strip(),
-                        limit=int(m_limit),
-                        only_priced=only_paid_flag,
-                        currency=currency,
-                    )
-                    total_in_cults = raw_search.get("total", 0)
-                    results = raw_search.get("results") or []
-
-                    rows = []
-                    all_niche_tags: List[str] = []
-                    for r in results:
-                        p_cents = (r.get("price") or {}).get("cents") or 0
-                        p_val = round(p_cents / 100.0, 2)
-                        if m_price_filter == "Apenas Gratuitos" and p_val > 0:
-                            continue
-
-                        v_cnt = int(r.get("viewsCount") or 0)
-                        l_cnt = int(r.get("likesCount") or 0)
-                        d_cnt = int(r.get("downloadsCount") or 0)
-                        est_rev = round(p_val * d_cnt, 2)
-                        conv_dl = round((d_cnt / v_cnt * 100.0), 2) if v_cnt > 0 else 0.0
-                        r_tags = [str(t).strip().lower() for t in (r.get("tags") or []) if str(t).strip()]
-                        all_niche_tags.extend(r_tags)
-
-                        rows.append({
-                            "nome": r.get("name") or "",
-                            "criador": (r.get("creator") or {}).get("nick") or "?",
-                            "preco": p_val,
-                            "views": v_cnt,
-                            "likes": l_cnt,
-                            "downloads": d_cnt,
-                            "receita_est": est_rev,
-                            "conv_dl_%": conv_dl,
-                            "url": r.get("url") or "",
-                        })
-
-                    if not rows:
-                        st.info("Nenhum modelo encontrado com esses filtros.")
-                    else:
-                        df_m = pd.DataFrame(rows)
-                        paid_subset = df_m[df_m["preco"] > 0]
-
-                        avg_price = float(paid_subset["preco"].mean()) if not paid_subset.empty else 0.0
-                        med_price = float(paid_subset["preco"].median()) if not paid_subset.empty else 0.0
-                        avg_dl = float(df_m["downloads"].mean())
-                        total_est_rev = float(df_m["receita_est"].sum())
-
-                        # Índice de Oportunidade (0 a 100): procura alta vs concorrência moderada
-                        demand_pts = min(60.0, avg_dl * 1.5 + (total_est_rev / max(1, len(df_m))) * 0.5)
-                        comp_penalty = min(40.0, (total_in_cults / 500.0) * 40.0)
-                        opp_score = int(max(10, min(100, round(demand_pts + (40.0 - comp_penalty)))))
-
-                        mk1, mk2, mk3, mk4, mk5 = st.columns(5)
-                        mk1.metric(
-                            "Resultados Totais",
-                            f"{total_in_cults:,}",
-                            help="Total de peças existentes no Cults3D para esta pesquisa (mede a saturação).",
-                        )
-                        mk2.metric(
-                            "Índice Oportunidade",
-                            f"{opp_score}/100",
-                            help="Pontuação que cruza procura (downloads/receita) com saturação de concorrentes.",
-                        )
-                        mk3.metric(
-                            f"Preço Médio / Mediana",
-                            f"{avg_price:.2f} / {med_price:.2f} {currency}",
-                            help="Preço médio e mediano dos modelos pagos neste nicho.",
-                        )
-                        mk4.metric(
-                            "Média Downloads",
-                            f"{avg_dl:.1f}",
-                            help="Média de downloads por peça na amostra analisada.",
-                        )
-                        mk5.metric(
-                            f"Receita Est. Amostra",
-                            f"{total_est_rev:,.2f} {currency}",
-                            help="Soma estimada (Preço × Downloads) das peças analisadas.",
-                        )
-
-                        st.divider()
-                        ch_c1, ch_c2 = st.columns([1.4, 1])
-
-                        with ch_c1:
-                            st.markdown("#### 📊 Downloads por Faixa de Preço")
-                            if not paid_subset.empty:
-                                chart_df = paid_subset[["preco", "downloads"]].groupby("preco")["downloads"].mean()
-                                st.bar_chart(chart_df)
-                            else:
-                                st.caption("Sem modelos pagos na amostra para gerar gráfico de preços.")
-
-                        with ch_c2:
-                            st.markdown("#### 🏷️ Top Keywords & Concorrentes")
-                            if all_niche_tags:
-                                top_tags = Counter(all_niche_tags).most_common(12)
-                                st.write("**Tags mais usadas pelos líderes:**")
-                                st.code(", ".join(f"{t} ({cnt})" for t, cnt in top_tags), language=None)
-
-                            top_creators = (
-                                df_m.groupby("criador")
-                                .agg(pecas=("nome", "count"), downloads=("downloads", "sum"), receita_est=("receita_est", "sum"))
-                                .sort_values(by="downloads", ascending=False)
-                                .head(5)
-                            )
-                            st.write("**Top Criadores neste Nicho:**")
-                            st.dataframe(top_creators, use_container_width=True)
-
-                        sort_map = {
-                            "Receita Estimada": "receita_est",
-                            "Downloads": "downloads",
-                            "Likes": "likes",
-                            "Views": "views",
-                            "Preço": "preco",
-                        }
-                        st.markdown("#### 📋 Modelos Encontrados")
-                        st.dataframe(
-                            df_m.sort_values(by=sort_map[m_sort], ascending=False),
-                            use_container_width=True,
-                            hide_index=True,
-                            column_config={
-                                "nome": "Modelo",
-                                "criador": "Criador",
-                                "preco": st.column_config.NumberColumn(f"Preço ({currency})", format="%.2f"),
-                                "receita_est": st.column_config.NumberColumn(f"Receita Est. ({currency})", format="%.2f"),
-                                "conv_dl_%": st.column_config.NumberColumn("DL/Views (%)", format="%.2f%%"),
-                                "url": st.column_config.LinkColumn("Link", display_text="Ver"),
-                            },
-                        )
-                except Exception as e:
-                    st.error(str(e))
-
-
-# ==============================================================================
-# ABA 6: CONSOLA GRAPHQL & DIAGNÓSTICO DE SCHEMA
-# ==============================================================================
-with tab_console:
-    st.subheader("🛠️ Consola GraphQL & Diagnóstico Técnico")
-    col_g1, col_g2 = st.columns([2, 1])
-
-    with col_g1:
-        raw_query = st.text_area(
-            "Query ou Mutation GraphQL",
-            value="query {\n  myself {\n    user { nick url }\n    creationsBatch(limit: 5) {\n      total\n      results { id name viewsCount }\n    }\n  }\n}",
-            height=190,
-            help="Permite executar qualquer pedido GraphQL diretamente contra o endpoint do Cults3D.",
-        )
-        raw_vars = st.text_input("Variables (JSON)", value="{}", help="Variáveis JSON opcionais para a query.")
-        if st.button("▶️ Executar Pedido"):
+    if st.button("🔎 Analisar & Extrair Keywords", type="primary") and m_query.strip():
+        with st.spinner(f"A minerar dados de '{m_query.strip()}'..."):
             try:
-                res = client.execute(raw_query, json.loads(raw_vars) if raw_vars.strip() else {})
-                st.json(res)
+                raw_search = client.search_market(
+                    search_query=m_query.strip(),
+                    limit=int(m_limit),
+                    only_priced=(m_price_filter == "Apenas Pagos"),
+                    currency=currency,
+                )
+                total_in_cults = raw_search.get("total", 0)
+                results = raw_search.get("results") or []
+
+                rows = []
+                all_niche_tags: List[str] = []
+                top_titles: List[str] = []
+
+                for r in results:
+                    p_val = round(((r.get("price") or {}).get("cents") or 0) / 100.0, 2)
+                    if m_price_filter == "Apenas Gratuitos" and p_val > 0:
+                        continue
+                    v_cnt = int(r.get("viewsCount") or 0)
+                    l_cnt = int(r.get("likesCount") or 0)
+                    d_cnt = int(r.get("downloadsCount") or 0)
+                    est_rev = round(p_val * d_cnt, 2)
+                    r_tags = [str(t).strip().lower() for t in (r.get("tags") or []) if str(t).strip()]
+                    all_niche_tags.extend(r_tags)
+                    if d_cnt > 0 or l_cnt > 2:
+                        top_titles.append(r.get("name") or "")
+
+                    rows.append({
+                        "nome": r.get("name") or "",
+                        "criador": (r.get("creator") or {}).get("nick") or "?",
+                        "preco": p_val,
+                        "views": v_cnt,
+                        "likes": l_cnt,
+                        "downloads": d_cnt,
+                        "receita_est": est_rev,
+                        "url": r.get("url") or "",
+                    })
+
+                if not rows:
+                    st.info("Sem resultados para estes filtros.")
+                else:
+                    df_m = pd.DataFrame(rows)
+                    paid_sub = df_m[df_m["preco"] > 0]
+                    avg_p = float(paid_sub["preco"].mean()) if not paid_sub.empty else 0.0
+                    med_p = float(paid_sub["preco"].median()) if not paid_sub.empty else 0.0
+                    avg_dl = float(df_m["downloads"].mean())
+                    tot_rev = float(df_m["receita_est"].sum())
+                    opp_score = int(max(10, min(100, round(min(60.0, avg_dl * 1.5 + (tot_rev / max(1, len(df_m))) * 0.5) + (40.0 - min(40.0, (total_in_cults / 500.0) * 40.0))))))
+
+                    mk1, mk2, mk3, mk4, mk5 = st.columns(5)
+                    mk1.metric("Total no Cults3D", f"{total_in_cults:,}")
+                    mk2.metric("Índice Oportunidade", f"{opp_score}/100")
+                    mk3.metric("Preço Médio / Mediana", f"{avg_p:.2f} / {med_p:.2f} {currency}")
+                    mk4.metric("Média Downloads", f"{avg_dl:.1f}")
+                    mk5.metric("Receita Est. Amostra", f"{tot_rev:,.2f} {currency}")
+
+                    st.divider()
+                    ng1, ng2 = st.columns(2)
+                    with ng1:
+                        st.markdown("#### 🧠 Combinações de Palavras dos Líderes (N-Grams)")
+                        bigrams = extract_ngrams(top_titles or df_m["nome"].tolist(), n=2, top_k=8)
+                        trigrams = extract_ngrams(top_titles or df_m["nome"].tolist(), n=3, top_k=5)
+                        if bigrams:
+                            st.write("**Expressões de 2 palavras mais lucrativas:**")
+                            st.code(", ".join(f"{g} ({c}x)" for g, c in bigrams), language=None)
+                        if trigrams:
+                            st.write("**Expressões de 3 palavras (Cauda Longa):**")
+                            st.code(", ".join(f"{g} ({c}x)" for g, c in trigrams), language=None)
+
+                    with ng2:
+                        st.markdown("#### 🏷️ Top Tags Prontas a Copiar")
+                        if all_niche_tags:
+                            top_tags = [t for t, _ in Counter(all_niche_tags).most_common(15)]
+                            st.caption("Copia estas tags para os teus modelos deste nicho:")
+                            st.code(", ".join(top_tags), language=None)
+
+                    sort_map = {"Receita Estimada": "receita_est", "Downloads": "downloads", "Likes": "likes", "Views": "views", "Preço": "preco"}
+                    st.dataframe(
+                        df_m.sort_values(by=sort_map[m_sort], ascending=False),
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "preco": st.column_config.NumberColumn(f"Preço ({currency})", format="%.2f"),
+                            "receita_est": st.column_config.NumberColumn(f"Receita Est. ({currency})", format="%.2f"),
+                            "url": st.column_config.LinkColumn("Link", display_text="Ver"),
+                        },
+                    )
             except Exception as e:
                 st.error(str(e))
 
+
+# ==============================================================================
+# ABA 6: CONSOLA GRAPHQL
+# ==============================================================================
+with tab_console:
+    st.subheader("🛠️ Consola GraphQL")
+    col_g1, col_g2 = st.columns([2, 1])
+    with col_g1:
+        raw_query = st.text_area("Query ou Mutation", value="query {\n  myself {\n    user { nick url }\n    creationsBatch(limit: 5) {\n      total\n      results { id name viewsCount }\n    }\n  }\n}", height=180)
+        raw_vars = st.text_input("Variables (JSON)", value="{}")
+        if st.button("▶️ Executar"):
+            try:
+                st.json(client.execute(raw_query, json.loads(raw_vars) if raw_vars.strip() else {}))
+            except Exception as e:
+                st.error(str(e))
     with col_g2:
-        st.markdown("**Inspecionar Schema da API**")
-        type_to_check = st.text_input(
-            "Tipo (ex: Mutation, Query, Creation)",
-            value="Mutation",
-            help="Mostra todos os campos e argumentos aceites por qualquer tipo da API.",
-        )
+        type_to_check = st.text_input("Inspecionar Tipo", value="Mutation")
         if st.button("🔎 Inspecionar"):
             try:
                 st.json(client.introspect_type(type_to_check.strip()))
