@@ -2418,8 +2418,9 @@ with st.sidebar:
     )
 
     if bot.running:
+        mode_lbl_sb = "Simulação" if bot.config["dry_run"] else "Real"
         st.info(
-            f"🤖 Bot: **ATIVO** ({'Simulação' if bot.config['dry_run'] else 'Real'})\n\n"
+            f"🤖 Bot: **ATIVO** ({mode_lbl_sb})\n\n"
             f"🛡️ Anti-Sleep: `{bot.keepalive_status}`"
         )
     else:
@@ -2620,6 +2621,7 @@ with tab_dash:
             model_names_map = {row["nome"]: row for _, row in perf_df.iterrows()}
             chosen_name = st.selectbox("Escolhe um modelo", list(model_names_map.keys()))
             m_row = model_names_map[chosen_name]
+            m_id = m_row["id"]
             seo_eval = SeoOptimizerEngine.analyze_listing(m_row["nome"], m_row["descricao"], m_row["tags_list"], m_row["preco"])
 
             ic1, ic2, ic3, ic4 = st.columns(4)
@@ -2644,10 +2646,10 @@ with tab_dash:
                             float(m_row["preco"]),
                             currency,
                         )
-                        st.session_state[f"qe_n_{m_row['id']}"] = ai_res.get("title", m_row["nome"])
-                        st.session_state[f"qe_d_{m_row['id']}"] = ai_res.get("description", m_row["descricao"])
-                        st.session_state[f"qe_t_{m_row['id']}"] = ", ".join(ai_res.get("tags") or m_row["tags_list"])
-                        st.session_state[f"qe_msg_{m_row['id']}"] = ai_res.get("summary", "Anúncio otimizado pela IA!")
+                        st.session_state[f"qe_n_{m_id}"] = ai_res.get("title", m_row["nome"])
+                        st.session_state[f"qe_d_{m_id}"] = ai_res.get("description", m_row["descricao"])
+                        st.session_state[f"qe_t_{m_id}"] = ", ".join(ai_res.get("tags") or m_row["tags_list"])
+                        st.session_state[f"qe_msg_{m_id}"] = ai_res.get("summary", "Anúncio otimizado pela IA!")
                         st.rerun()
                     except Exception as e:
                         st.error(str(e))
@@ -2656,24 +2658,25 @@ with tab_dash:
                 opt_n, opt_d, opt_t = SeoOptimizerEngine.auto_optimize_listing(
                     m_row["nome"], m_row["descricao"], m_row["tags_list"]
                 )
-                st.session_state[f"qe_n_{m_row['id']}"] = opt_n
-                st.session_state[f"qe_d_{m_row['id']}"] = opt_d
-                st.session_state[f"qe_t_{m_row['id']}"] = ", ".join(opt_t)
+                st.session_state[f"qe_n_{m_id}"] = opt_n
+                st.session_state[f"qe_d_{m_id}"] = opt_d
+                st.session_state[f"qe_t_{m_id}"] = ", ".join(opt_t)
                 st.rerun()
 
-            if st.session_state.get(f"qe_msg_{m_row['id']}"):
-                st.markdown(f"<div class='ai-card'>🧠 <b>IA:</b> {st.session_state[f'qe_msg_{m_row[\"id\"]}']}</div>", unsafe_allow_html=True)
+            ai_summary_msg = st.session_state.get(f"qe_msg_{m_id}")
+            if ai_summary_msg:
+                st.markdown(f"<div class='ai-card'>🧠 <b>IA:</b> {ai_summary_msg}</div>", unsafe_allow_html=True)
 
             with st.form("quick_edit_single_form"):
-                qe_name = st.text_input("Título", value=st.session_state.get(f"qe_n_{m_row['id']}", m_row["nome"]))
+                qe_name = st.text_input("Título", value=st.session_state.get(f"qe_n_{m_id}", m_row["nome"]))
                 qe_price = st.number_input(f"Preço ({currency})", min_value=0.0, step=0.5, value=float(m_row["preco"]))
-                qe_tags = st.text_input("Tags (até 20, separadas por vírgula)", value=st.session_state.get(f"qe_t_{m_row['id']}", m_row["tags"]))
-                qe_desc = st.text_area("Descrição", value=st.session_state.get(f"qe_d_{m_row['id']}", m_row["descricao"]), height=160)
+                qe_tags = st.text_input("Tags (até 20, separadas por vírgula)", value=st.session_state.get(f"qe_t_{m_id}", m_row["tags"]))
+                qe_desc = st.text_area("Descrição", value=st.session_state.get(f"qe_d_{m_id}", m_row["descricao"]), height=160)
                 if st.form_submit_button("💾 Aplicar no Cults3D", type="primary"):
                     try:
                         final_tags = [t.strip() for t in qe_tags.split(",") if t.strip()][:20]
                         client.update_creation(
-                            creation_id=m_row["id"],
+                            creation_id=m_id,
                             name=qe_name.strip(),
                             description=qe_desc.strip(),
                             price=qe_price,
@@ -2682,7 +2685,7 @@ with tab_dash:
                         )
                         bot.record_action(
                             "EDIÇÃO_IA_SEO",
-                            m_row["id"],
+                            m_id,
                             m_row["nome"],
                             f"Título/SEO/Preço ({qe_price:.2f} {currency})",
                             before_state={"name": m_row["nome"], "description": m_row["descricao"], "price": m_row["preco"], "tags": m_row["tags_list"]},
@@ -2727,8 +2730,9 @@ with tab_publish:
         if uploaded_images:
             img_cols = st.columns(min(4, len(uploaded_images)))
             for idx_img, up_img in enumerate(uploaded_images):
+                cap_lbl = "⭐ Capa" if idx_img == 0 else f"Foto {idx_img + 1}"
                 with img_cols[idx_img % 4]:
-                    st.image(up_img, caption=f"{'⭐ Capa' if idx_img == 0 else f'Foto {idx_img + 1}'}", use_container_width=True)
+                    st.image(up_img, caption=cap_lbl, use_container_width=True)
 
         uploaded_3d_files = st.file_uploader(
             "Ficheiros 3D para Impressão (STL, 3MF, OBJ, STEP, ZIP)",
@@ -2839,7 +2843,9 @@ with tab_publish:
             st.caption(f"⚠️ {tip}")
 
         st.markdown("#### 👁️ Pré-visualização Final")
-        st.markdown(f"<div class='seo-card'><b>{final_pub_name or 'Título do Modelo'}</b><br><br>{final_pub_desc.replace(chr(10), '<br>')}</div>", unsafe_allow_html=True)
+        preview_html_desc = final_pub_desc.replace("\n", "<br>")
+        preview_title_show = final_pub_name or "Título do Modelo"
+        st.markdown(f"<div class='seo-card'><b>{preview_title_show}</b><br><br>{preview_html_desc}</div>", unsafe_allow_html=True)
 
     st.divider()
     golden_utc = next_golden_hour_utc()
@@ -3666,7 +3672,8 @@ with tab_market:
                                 bigrams=[g for g, _ in bigrams],
                                 currency=currency,
                             )
-                            st.markdown(f"<div class='ai-card'><b>🧠 Diagnóstico Estratégico Gemini IA:</b><br><br>{ai_advice.replace(chr(10), '<br>')}</div>", unsafe_allow_html=True)
+                            ai_advice_html = ai_advice.replace("\n", "<br>")
+                            st.markdown(f"<div class='ai-card'><b>🧠 Diagnóstico Estratégico Gemini IA:</b><br><br>{ai_advice_html}</div>", unsafe_allow_html=True)
                         except Exception as ai_exc:
                             st.caption(f"Nota IA: {ai_exc}")
 
